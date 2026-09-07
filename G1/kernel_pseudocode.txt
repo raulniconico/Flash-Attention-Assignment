@@ -1,0 +1,158 @@
+CONTROL-CPU PSEUDOCODE — FLASH ATTENTION FOR THE PROVIDED ARCHITECTURE
+====================================================================
+Default: preserve 16-bit stored Q/K/V; use the memory-only vector CPU.
+FP32 arithmetic/state is an explicit assumption. Device API names are abstract.
+The control CPU only submits work, manages SRAM, and processes completion events.
+Statements inside VECTOR_PROGRAM execute on the vector CPU, never on control.
+
+DATA LAYOUT
+  Q[b, kv_head, query_head_in_group, token, channel] : activation16
+  KV[b, kv_head, K_or_V, token, channel]            : activation16
+  O has the same logical layout as Q.
+  Place each KV head group contiguously so one large DMA loads K and V.
+  Store sequence-major data within each head. Projection epilogues emit this
+  layout directly; otherwise charge an explicit vector transpose and DMA pass.
+  GQA maps query head h to KV head floor(h/4); do not replicate stored KV.
+
+SRAM ALLOCATION FOR PREFILL (16 MiB total)
+  bundle[0], bundle[1], each 5 MiB:
+    KV16[2,2048,128]  = 1 MiB
+    Q16 [4,2048,128]  = 2 MiB
+    O16 [4,2048,128]  = 2 MiB
+  work[512 KiB]: S32[16,128], P32[16,128], U32[16,128], m32[16], l32[16],
+                 alpha32[16], reduction temporaries, alignment padding
+  descriptors_and_misc[512 KiB]
+  spare[5 MiB]
+  Vector-local microkernel storage >=12 KiB is separate and assumed.
+  For decode, resize each bundle to the actual context (<=2303 keys in the
+  255 decode forwards); tiny Q/O replace the large prefill Q/O allocation.
+
+CONTROL PROCEDURE PREFILL_ATTENTION(layer)
+  jobs = [(b,g) for b in 0..15 for g in 0..7]
+  state[0..1] = FREE
+  next_job = 0
+  vector_busy = false
+  # DMA transfers share ONE 64 B/cycle path; the scheduler serializes them.
+  # These are dependencies, not a claim of a zero-cost hardware command list.
+  while unfinished jobs exist:
+    for slot in [0,1]:
+      if state[slot] == FREE and next_job < len(jobs):
+        (b,g) = jobs[next_job++]; owner[slot] = (b,g)
+        eK = DMA_READ(KV_DRAM[layer,b,g], bundle[slot].KV16)
+        eQ = DMA_READ(Q_DRAM[b,g], bundle[slot].Q16, after=eK)
+        state[slot] = LOADING(eQ)
+
+    for slot in [0,1]:
+      if state[slot] == LOADING(e) and COMPLETED(e):
+        state[slot] = READY
+
+    if not vector_busy and any slot is READY:
+      slot = oldest READY slot
+      eV = VECTOR_LAUNCH(PREFILL_GROUP, bundle[slot], work)
+      vector_busy = true; state[slot] = COMPUTING(eV)
+
+    for slot in [0,1]:
+      if state[slot] == COMPUTING(e) and COMPLETED(e):
+        vector_busy = false
+        (b,g) = owner[slot]
+        eW = DMA_WRITE(bundle[slot].O16, O_DRAM[b,g])
+        state[slot] = STORING(eW)
+      if state[slot] == STORING(e) and COMPLETED(e):
+        state[slot] = FREE
+    WAIT_FOR_NEXT_RELEVANT_EVENT_IF_NO_PROGRESS()
+  # Never reuse a bundle until its output DMA completes.
+
+VECTOR_PROGRAM PREFILL_GROUP(bundle, work)
+  for h in 0..3:
+    for i in range(0,2048,16):
+      U32 = zeros(16,128); m32 = -infinity; l32 = 0
+      for j in range(0,2048,128):
+        if j > min(i+15,2047): break  # wholly above causal diagonal
+        # 16x128 FP32 register accumulator; stream 128 reduction positions.
+        # Read 16x128 Q16 and 128x128 K16; write S32 to SRAM.
+        S32 = VECTOR_GEMM_QK(Q16[h,i:i+16,:], KV16[K,j:j+128,:]) / sqrt(128)
+        for row r in 0..15:
+          S32[r, key_position > i+r] = -infinity
+          if no valid key in this row/block:
+            P32[r,:] = 0; alpha32[r] = 1; continue
+          new_m = max(m32[r], max(S32[r,:]))
+          alpha32[r] = 0 if l32[r] == 0 else exp(m32[r]-new_m)
+          P32[r,:] = exp(S32[r,:]-new_m)
+          l32[r] = alpha32[r]*l32[r] + sum(P32[r,:])
+          U32[r,:] *= alpha32[r]
+          m32[r] = new_m
+        # Read/write SRAM U once; keep its 16x128 accumulator in registers
+        # for the complete 128-position reduction. P remains FP32.
+        U32 += VECTOR_GEMM_PV(P32, KV16[V,j:j+128,:])
+      O16[h,i:i+16,:] = CAST_ACTIVATION16(U32 / l32[:,None])
+  # The complete 2048x2048 score/probability matrix never exists.
+
+CONTROL PROCEDURE DECODE_ATTENTION(layer, context)
+  APPEND_NEW_KV_AND_WAIT_FOR_VISIBILITY(layer)
+  # Reuse the two-bundle scheduler above for the 128 (batch,KV-head) jobs.
+  # Load each group's entire KV once, plus four current queries.
+  # Launch DECODE_GROUP once per job; store its four outputs once.
+  SCHEDULE_DOUBLE_BUFFERED_GROUPS(DECODE_GROUP, context)
+
+VECTOR_PROGRAM DECODE_GROUP(Q16[4,128], K16[context,128], V16[context,128])
+  # Q32/16, U32, m/l, and a 4x128 temporary fit within the assumed 12 KiB.
+  keep Q16 local; U32=zeros(4,128); m32=-infinity; l32=0
+  for j in range(0,context,128):
+    count=min(128,context-j)
+    S32[4,count]=0
+    for t in 0..count-1:
+      # Broadcast each loaded key element to all four query-head rows.
+      S32[:,t] = DOT_EACH_QUERY_WITH_KEY(Q16,K16[j+t,:]) / sqrt(128)
+    UPDATE_LOCAL_ONLINE_SOFTMAX_AND_RESCALE_U(S32,m32,l32,U32)
+    for t in 0..count-1:
+      # Read each V element once and update all four U rows.
+      U32[:,:] += P32[:,t,None] * V16[j+t,None,:]
+  return CAST_ACTIVATION16(U32/l32[:,None])
+  # All keys are past/current keys for this query; mask padding in the tail.
+
+CONTROL PROCEDURE DENSE_W8_A16(X, W, M, K, N)
+  # Needed for end-to-end TTFT/interactivity; not part of flash attention.
+  for i in range(0,M,256):
+    rows=min(256,M-i)
+    DMA_READ_AND_WAIT(X[i:i+rows,:], SRAM_A)
+    pipeline output panels c=0,128,...,N-128:
+      DMA_READ(W[:,c:c+128] and scales[c:c+128], next_weight_slot)
+      wait for that panel and VECTOR_LAUNCH(DENSE_PANEL, SRAM_A, weight_slot,
+                                           SRAM_OUTPUT[:,c:c+128])
+      # Only one vector program runs; DMA can fill the other weight slot.
+    wait for all panels
+    DMA_WRITE_AND_WAIT(SRAM_OUTPUT, Y[i:i+rows,:])
+
+VECTOR_PROGRAM DENSE_PANEL(A16[rows,K], W8[K,128], scales[128])
+  for r in range(0,rows,16):
+    C32[16,128]=0 in local register storage
+    for k in 0..K-1:
+      a16=read A16[r:r+16,k]
+      w8=read W8[k,:]
+      C32 += outer(convert(a16), dequantize(w8,scales))
+    store activation16(C32)  # FP32 instead for TP row-parallel partial outputs
+
+OPTIONAL SYSTOLIC BACKEND — NOT ENABLED BY DEFAULT
+  Require a specified numerical format, accumulator and output contract.
+  If input is activation16 and 8-bit requantization has not been authorized:
+    use VECTOR_GEMM; never silently cast activation16 to int8.
+  If int8 is authorized:
+    VECTOR_QUANTIZE_AND_PACK; carry all scales and zero-point corrections.
+    For QK with R query rows (16 or 32):
+      for c in range(0,Bc,16):
+        ARRAY_LAUNCH(R,16,K=128, Q8[R,128], K8[c:c+16,128])
+        VECTOR_DEQUANTIZE_PARTIAL_SCORE_AND_SCALE_BY_INVERSE_SQRT_D()
+    Compute online softmax on vector CPU, maintaining FP32 m,l,U.
+    Quantize block probabilities with an explicit error budget.
+    For PV:
+      for d0 in range(0,128,16):
+        # Right operand rows must be V[:,d0:d0+16]^T, i.e. 16 x Bc.
+        ARRAY_LAUNCH(R,16,K=Bc, P8[R,Bc], packed_V8[d0:d0+16,Bc])
+        VECTOR_DEQUANTIZE_AND_ADD_TO_U32()
+    Dynamically assign independent query-row jobs to both arrays;
+    do not force one array to QK and the other to PV.
+    Use separate input/output slots; overlap next compute with prior output.
+  If the only output is raw signed INT16 without wider accumulation/scaling,
+  check range BEFORE launch. Full-range int8 K=128/256 dot products overflow.
+  A safe but usually slow fallback is a tiny reduction slice followed by
+  wide vector accumulation; do not claim the one-pass throughput for it.

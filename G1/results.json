@@ -1,0 +1,136 @@
+{
+  "assumptions": {
+    "backend": "memory-only vector CPU; >=12 KiB local working storage",
+    "sampling": "greedy",
+    "resident_model": true,
+    "reduction_payload_bytes": 4,
+    "host_collective_latency_s": 0,
+    "quant_scale": "FP32 per output column",
+    "array_compute_timing": "not needed by primary backend"
+  },
+  "counts": {
+    "layer_linear_weights": 218103808,
+    "streamed_weight_bytes_per_step": 7504658432,
+    "total_weight_bytes_including_input_embedding": 8029995008,
+    "kv_bytes_at_2048": 4294967296,
+    "kv_bytes_at_2304": 4831838208,
+    "prefill_dense_macs": 228698418577408,
+    "prefill_causal_attention_macs": 8800387989504,
+    "decode_dense_macs": 120074534912,
+    "decode_attention_macs_at_2176": 9126805504
+  },
+  "prefill": {
+    "dense_s": 143.745785856,
+    "head_and_sampling_s": 0.008786474,
+    "attention_s": 19.351205184,
+    "auxiliary_s": 4.63487432,
+    "warm_ttft_s": 167.740651834,
+    "attention_details": {
+      "visited_tiles_per_head": 1088,
+      "tile_vector_bytes": 135424,
+      "vector_cycles_per_group": 4687148.0,
+      "dma_cycles_per_group": 83070.0
+    }
+  },
+  "decode_first": {
+    "dense_s": 0.125335658,
+    "attention_s": 0.072817856,
+    "auxiliary_s": 0.002475408,
+    "collective_staging_s": 0.0,
+    "step_s": 0.200628922,
+    "per_sequence_tokens_s": 4.984326237869134,
+    "aggregate_tokens_s": 79.74921980590615
+  },
+  "decode_average_context": {
+    "dense_s": 0.125335658,
+    "attention_s": 0.07702816,
+    "auxiliary_s": 0.002475408,
+    "collective_staging_s": 0.0,
+    "step_s": 0.204839226,
+    "per_sequence_tokens_s": 4.881877458373134,
+    "aggregate_tokens_s": 78.11003933397015
+  },
+  "decode_last": {
+    "dense_s": 0.125335658,
+    "attention_s": 0.081238464,
+    "auxiliary_s": 0.002475408,
+    "collective_staging_s": 0.0,
+    "step_s": 0.20904953,
+    "per_sequence_tokens_s": 4.783555361258167,
+    "aggregate_tokens_s": 76.53688578013067
+  },
+  "generation": {
+    "decode_forwards": 255,
+    "decode_total_s": 52.23400263,
+    "average_step_s": 0.20483922599999999,
+    "per_sequence_tokens_s": 4.881877458373134,
+    "aggregate_tokens_s": 78.11003933397015
+  },
+  "four_way": {
+    "average_step_excluding_host_network_s": 0.055230066,
+    "conditional_per_sequence_tokens_s": 18.106080119476953,
+    "conditional_aggregate_tokens_s": 289.69728191163125,
+    "traffic_floor_s": 0.047140864,
+    "traffic_ceiling_per_sequence_tokens_s": 21.21301807281258,
+    "traffic_ceiling_aggregate_tokens_s": 339.4082891650013,
+    "host_aggregate_bytes_per_step": 134218496,
+    "host_GB_s_70pct_schedule_serial": 5.670398631547292,
+    "host_GB_s_70pct_traffic_ceiling_serial": 11.079595035638626,
+    "host_GB_s_70pct_traffic_ceiling_perfect_overlap": 1.9930255669476062
+  },
+  "sensitivity": {
+    "prefill_attention": {
+      "dram_bw": -0.0,
+      "dma_sram_bw": -0.0,
+      "vector_bw": 0.9997881979346818,
+      "dma_setup": -9.971389657275638e-07,
+      "vector_launch": -6.431544295073113e-05,
+      "both_memory_links": 0.00013461385103920328
+    },
+    "decode_attention": {
+      "dram_bw": -0.0,
+      "dma_sram_bw": -0.0,
+      "vector_bw": 0.003590617493396297,
+      "dma_setup": -0.03230978592248071,
+      "vector_launch": -0.00012525178307002218,
+      "both_memory_links": 0.9306586115408809
+    },
+    "decode_total": {
+      "dram_bw": -0.0,
+      "dma_sram_bw": -0.0,
+      "vector_bw": 0.012775706007242194,
+      "dma_setup": -0.024471339767504385,
+      "vector_launch": -0.0006152414110183169,
+      "both_memory_links": 0.9356902117048993
+    }
+  },
+  "improvements": {
+    "double_memory_path": {
+      "dense_s": 0.07949923,
+      "attention_s": 0.041032,
+      "auxiliary_s": 0.001704336,
+      "collective_staging_s": 0.0,
+      "step_s": 0.122235566,
+      "per_sequence_tokens_s": 8.180925018173516,
+      "aggregate_tokens_s": 130.89480029077626
+    },
+    "double_vector_bandwidth": {
+      "dense_s": 0.124534776,
+      "attention_s": 0.07688864,
+      "auxiliary_s": 0.002098576,
+      "collective_staging_s": 0.0,
+      "step_s": 0.203521992,
+      "per_sequence_tokens_s": 4.913473920793779,
+      "aggregate_tokens_s": 78.61558273270046
+    },
+    "ideal_dma_descriptor_and_latency_hiding": {
+      "dense_s": 0.120464908,
+      "attention_s": 0.07228096,
+      "auxiliary_s": 0.002343808,
+      "collective_staging_s": 0.0,
+      "step_s": 0.195089676,
+      "per_sequence_tokens_s": 5.125847869058945,
+      "aggregate_tokens_s": 82.01356590494312
+    }
+  }
+}
