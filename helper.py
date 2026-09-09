@@ -89,3 +89,5 @@ def plot(img, width):
     img = Image.open(img)
     height = round(img.height * width / img.width)
     display(img.resize((width, height)))
+
+
