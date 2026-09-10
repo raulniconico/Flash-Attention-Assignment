@@ -60,10 +60,10 @@ class Hardware:
     dram_write_latency: int = 150
     vector_launch: int = 300
     array_latency: int = 100
-    control: str = 'serialized'
+    control: str = 'serialized' # serialized/pipelined
     issue_interval: int = 1
-    array_model: str = 'mac'
-    arithmetic: str = 'safe-int8'
+    array_model: str = 'mac' # mac / bandwidth
+    arithmetic: str = 'native-int8' #safe-int8 / native-int8
 
     @property
     def digits(self) -> int:
