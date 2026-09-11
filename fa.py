@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from tile_model import Hardware, VCPU, SA1, SA2, divup, DMA, SRAM, data_bytes
+from tile_model import Hardware, VCPU, SA1, SA2, divup, DMA, SRAM
 
 QK_LEAD = 2  # Arrays queue QK(p+QK_LEAD) before PV(p): PV lags two key blocks.
 PACK_LOOKAHEAD = QK_LEAD + 1  # QK operands are packed this many blocks ahead.
@@ -22,52 +22,45 @@ def _array_matmul(m, n, depth, rows_sa1, R, hw, diag=None, axis='cols'):
     job is skipped when every entry it produces (or consumes) is masked.
     """
     arrays = [SA1(compute_model=hw.array_model), SA2(compute_model=hw.array_model)]
-    row_counts = [min(m, rows_sa1), max(0, m - rows_sa1)]
-    row_bases = [0, min(m, rows_sa1)]
-    jobs, packed_bytes, raw_bytes, skipped = [], 0, 0, 0
-    for sa, rows, base in zip(arrays, row_counts, row_bases):
-        padded_rows = divup(rows, sa.physical_rows) * sa.physical_rows
-        padded_cols = divup(n, 16) * 16
-        packed_bytes += hw.digits * (padded_rows + padded_cols) * depth if rows else 0
-        stream = []
+    split = min(m, rows_sa1)
+    stages, packed_bytes, raw_bytes, skipped = [], 0, 0, 0
+    for sa, base, rows in zip(arrays, (0, split), (split, m - split)):
+        if rows:
+            padded_rows = divup(rows, sa.physical_rows) * sa.physical_rows
+            packed_bytes += hw.digits * (padded_rows + divup(n, 16) * 16) * depth
+        stream = []  # stage (input/compute) cycles of each job, in issue order
         for r in range(0, rows, sa.physical_rows):
             last_row = base + r + min(sa.physical_rows, rows-r) - 1
             for c in range(0, n, 16):
                 for k in range(0, depth, R):
-                    first = c if axis == 'cols' else k
-                    if diag is not None and first - last_row > diag:
+                    if diag is not None and (c if axis == 'cols' else k) - last_row > diag:
                         skipped += hw.digits**2
                         continue
-                    for _ in range(hw.digits**2):
-                        stream.append((min(sa.physical_rows, rows-r),
-                                       min(R, depth-k), min(16, n-c)))
-        jobs.append(stream)
+                    job = type(sa)(min(sa.physical_rows, rows-r), min(R, depth-k),
+                                   min(16, n-c), hw.array_model)
+                    stream += [job.stage_cycles()] * hw.digits**2
+        stages.append(stream)
         raw_bytes += len(stream) * sa.output_bytes()
 
-    cpu = 0
-    ready, drain, pos, first = [0, 0], [0, 0], [0, 0], [None, None]
-    while any(pos[a] < len(jobs[a]) for a in range(2)):
-        candidates = [a for a in range(2) if pos[a] < len(jobs[a])]
-        def issue_time(a):
-            advance = hw.array_latency if hw.control == 'pipelined' else 0
-            return max(cpu, ready[a] - advance)
-        a = min(candidates, key=lambda a: (issue_time(a), a))
-        issue = issue_time(a)
-        arrival = issue + hw.array_latency
-        first[a] = issue if first[a] is None else first[a]
-        rows, k, cols = jobs[a][pos[a]]
-        # compute() includes command + compute/input + final output drain.
-        isolated = arrays[a].compute(rows, k, 8, cols, hw=hw)
-        out = arrays[a].output_cycles()
-        stage = isolated - hw.array_latency - out
+    # Job = command latency + stage + output drain (SystolicArray.compute).
+    advance = hw.array_latency if hw.control == 'pipelined' else 0
+    interval = hw.issue_interval if hw.control == 'pipelined' else hw.array_latency
+    cpu, pos, ready, drain, first = 0, [0, 0], [0, 0], [0, 0], [None, None]
+    while True:
+        waiting = [(max(cpu, ready[a] - advance), a)
+                   for a in (0, 1) if pos[a] < len(stages[a])]
+        if not waiting:
+            break
+        issue, a = min(waiting)
+        if first[a] is None:
+            first[a] = issue
         # If the drain is occupied, hold the new result until it becomes free.
-        ready[a] = max(arrival + stage, drain[a])
-        drain[a] = ready[a] + out
-        cpu = issue + (hw.issue_interval if hw.control == 'pipelined'
-                       else hw.array_latency)
+        ready[a] = max(issue + hw.array_latency + stages[a][pos[a]], drain[a])
+        drain[a] = ready[a] + arrays[a].output_cycles()
+        cpu = issue + interval
         pos[a] += 1
-    return dict(start=first, end=drain, jobs=[len(x) for x in jobs],
-                skipped=skipped, rows_sa1=row_counts[0],
+    return dict(start=first, end=drain, jobs=[len(s) for s in stages],
+                skipped=skipped, rows_sa1=split,
                 packed_bytes=packed_bytes, raw_bytes=raw_bytes)
 
 
@@ -191,17 +184,14 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
     def vector(name, reads, writes, **kw):
         return task(name, 'VCPU', VCPU(reads, writes, hw).launch_cycle(), **kw)
 
-    def dma(name, shape, bits, direction, **kw):
-        return task(name, 'DMA', DMA(hw=hw).transfer(shape, bits, direction), **kw)
-
-    def nbytes(shape, dtype):
-        return data_bytes(shape, dtype)
+    def dma(name, shape, direction, **kw):  # all DRAM tensors are 16-bit
+        return task(name, 'DMA', DMA(hw=hw).transfer(shape, 16, direction), **kw)
 
     # K/V loaded once for all G query heads.
-    dK = dma('Load K16', (S,H), 16, 'read', alloc=[('K16', nbytes((S,H),16))])
+    dK = dma('Load K16', (S,H), 'read', alloc=[('K16', 2*S*H)])
     qK = vector('Quantize K', 4*S*H, S*H+4, deps=[dK],  # Two A16 reads.
-                alloc=[('K8', nbytes((S,H),8)), ('K_scale', 4)], free=['K16'])
-    qV = None
+                alloc=[('K8', S*H), ('K_scale', 4)], free=['K16'])
+    dV = dma('Load V16', (S,H), 'read', alloc=[('V16', 2*S*H)])
 
     tile_ready, packed, qk_done, pv_done = {}, {}, {}, {}
     prev_softmax, prev_update = {}, {}
@@ -211,8 +201,8 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
             return
         g, i, m = tiles[t]
         tag = f'h{g} q{i}'
-        d = dma(tag+' load Q16', (m,H), 16, 'read', deps=[tile_ready.get(t-1)],
-                alloc=[(f'Q16@t{t}', nbytes((m,H),16))])
+        d = dma(tag+' load Q16', (m,H), 'read', deps=[tile_ready.get(t-1)],
+                alloc=[(f'Q16@t{t}', 2*m*H)])
         tile_ready[t] = vector(
             tag+' quantize Q + init U,l,m', 4*m*H, 5*m*H+8*m+4, deps=[d],
             alloc=[(f'Q8@t{t}', m*H), (f'Q_scale@t{t}', 4), (f'U@t{t}', 4*m*H),
@@ -233,19 +223,20 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
                      alloc=[(f'QKdig@{p}', timing['packed_bytes'])])
         packed[p] = (pid, timing)
 
-    def emit_arrays(p, label, timing, deps, digits, raw):
-        return task(pairs[p]['tag']+' '+label, 'ARRAYS', max(timing['end']),
-                    deps=deps, alloc=[(raw, timing['raw_bytes'])],
-                    free=[digits], info=timing)
+    def emit_arrays(p, op, timing, dep):
+        return task(pairs[p]['tag']+' '+op, 'ARRAYS', max(timing['end']),
+                    deps=[dep], alloc=[(f'{op}raw@{p}', timing['raw_bytes'])],
+                    free=[f'{op}dig@{p}'], info=timing)
 
     def emit_qk(p):
+        emit_pack(p)  # already packed ahead when overlapping
         pid, timing = packed[p]
-        qk_done[p] = emit_arrays(p, 'QK', timing, [pid], f'QKdig@{p}', f'QKraw@{p}')
+        qk_done[p] = emit_arrays(p, 'QK', timing, pid)
 
     def emit_softmax_pv(p):
         pr = pairs[p]
         t, m, c, tag = pr['tile'], pr['m'], pr['c'], pr['tag']
-        raw_qk = tasks[qk_done[p]]['info']['raw_bytes']
+        raw_qk = packed[p][1]['raw_bytes']
         # Reconstruct in vector registers, discard padding, then scale to FP32.
         rec = vector(tag+' QK reconstruct', raw_qk+8, 4*m*c, deps=[qk_done[p]],
                      alloc=[(f'scores@{p}', 4*m*c)], free=[f'QKraw@{p}'])
@@ -264,9 +255,6 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
                     free=[f'P8@{p}'])
         return pk, timing
 
-    def emit_pv(p, pk, timing):
-        pv_done[p] = emit_arrays(p, 'PV', timing, [pk], f'PVdig@{p}', f'PVraw@{p}')
-
     def emit_update(p):
         pr = pairs[p]
         t, m, tag = pr['tile'], pr['m'], pr['tag']
@@ -284,33 +272,24 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
                           deps=[prev_update[t]], alloc=[(f'O16@t{t}', 2*m*H)],
                           free=[f'Q8@t{t}', f'Q_scale@t{t}', f'U@t{t}',
                                 f'l@t{t}', f'm@t{t}'])
-            dma(ttag+' store O16', (m,H), 16, 'write', deps=[norm],
+            dma(ttag+' store O16', (m,H), 'write', deps=[norm],
                 free=[f'O16@t{t}'])
 
-    dV = dma('Load V16', (S,H), 16, 'read', alloc=[('V16', nbytes((S,H),16))])
-
-    def emit_v():
-        nonlocal qV
-        qV = vector('Quantize V + transpose', 4*S*H, S*H+4, deps=[dV],
-                    alloc=[('V8T', nbytes((H,S),8)), ('V_scale', 4)], free=['V16'])
-
-    lead, lag = (QK_LEAD, UPDATE_LAG) if overlap else (0, 0)
-    if overlap:
-        for q in range(min(PACK_LOOKAHEAD, P)):
-            emit_pack(q)
-        for q in range(min(lead, P)):
-            emit_qk(q)
-    emit_v()
+    # Serial schedule = the same loop with no lead, lookahead or lag.
+    lead, ahead, lag = (QK_LEAD, PACK_LOOKAHEAD, UPDATE_LAG) if overlap else (0, 0, 0)
+    for q in range(ahead):
+        emit_pack(q)
+    for q in range(min(lead, P)):
+        emit_qk(q)
+    qV = vector('Quantize V + transpose', 4*S*H, S*H+4, deps=[dV],
+                alloc=[('V8T', S*H), ('V_scale', 4)], free=['V16'])
     for p in range(P):
-        if not overlap:
-            emit_pack(p)
         if p+lead < P:
             emit_qk(p+lead)
         pk, timing = emit_softmax_pv(p)
-        if overlap:
-            emit_pack(p+PACK_LOOKAHEAD)
-        emit_pv(p, pk, timing)
-        if p-lag >= 0:
+        emit_pack(p+ahead)
+        pv_done[p] = emit_arrays(p, 'PV', timing, pk)
+        if p >= lag:
             emit_update(p-lag)
     for p in range(max(0, P-lag), P):
         emit_update(p)
