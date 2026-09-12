@@ -457,3 +457,248 @@ def plot_flash_attention(result, path):
                loc='outside lower center', ncol=4)
     fig.savefig(path, dpi=160)
     plt.close(fig)
+
+def flash_decode(S=2048, H=128, G=4, Bc=256, R=256, hw=Hardware(),
+                 overlap=True, verbose=True, gantt_path=None):
+
+    for value in (S, H, G, Bc, R):
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError('S, H, G, Bc and R must be positive integers')
+
+    tasks = []
+    unit_free = {'DMA': 0, 'VCPU': 0, 'ARRAYS': 0}
+
+    def task(name, unit, duration, deps=(), alloc=(), free=(), info=None):
+        deps = [d for d in deps if d is not None]
+        if not overlap and tasks:
+            deps.append(tasks[-1]['id'])
+        start = max([unit_free[unit]] + [tasks[d]['end'] for d in deps])
+        rec = dict(id=len(tasks), name=name, unit=unit, start=start,
+                   end=start+duration, cycles=duration, deps=deps,
+                   alloc=list(alloc), free=list(free), info=info)
+        unit_free[unit] = rec['end']
+        tasks.append(rec)
+        return rec['id']
+
+    def vector(name, reads, writes, **kw):
+        return task(name, 'VCPU', VCPU(reads, writes, hw).launch_cycle(), **kw)
+
+    def dma(name, nbytes, direction, **kw):
+        return task(name, 'DMA', DMA(nbytes, direction, hw).cycle(), **kw)
+
+    def arrays(name, timing, dep, tag):
+        return task(name, 'ARRAYS', max(timing['end']), deps=[dep],
+                    alloc=[(f'{tag}raw', timing['raw_bytes'])],
+                    free=[f'{tag}dig'], info=timing)
+
+    # Q of this step: G rows, transposed to (H,G) for the column operand.
+    dQ = dma('Load Q16', 2*G*H, 'read', alloc=[('Q16', 2*G*H)])
+    qQ = vector('Quantize Q + transpose, init U,l,m', 4*G*H, G*H+4*H*G+8*G+4,
+                deps=[dQ], free=['Q16'],
+                alloc=[('Q8', G*H), ('Q_scale', 4), ('U', 4*H*G),
+                       ('l', 4*G), ('m', 4*G)])
+
+    packs, update = {}, None
+    for b, j in enumerate(range(0, S, Bc)):
+        c, tag = min(Bc, S-j), f'k{j}'
+        # INT8 cache blocks; load b waits for the pack of b-2 (two slots).
+        dk = dma(f'{tag} load K8', c*H, 'read', deps=[packs.get(b-2)],
+                 alloc=[(f'K8@{b}', c*H), (f'K_scale@{b}', 4)])
+        dv = dma(f'{tag} load V8T', c*H, 'read', deps=[packs.get(b-2)],
+                 alloc=[(f'V8T@{b}', c*H), (f'V_scale@{b}', 4)])
+
+        t_qk = _array_matmul(c, G, H, _balanced_split(c, G, H, R, hw), R, hw)
+        # Read each logical operand once; write digit planes including padding.
+        packs[b] = vector(f'{tag} QK pack', (c+G)*H, t_qk['packed_bytes'],
+                          deps=[dk, qQ], free=[f'K8@{b}', f'K_scale@{b}'],
+                          alloc=[(f'{tag}QKdig', t_qk['packed_bytes'])])
+        qk = arrays(f'{tag} QK', t_qk, packs[b], tag+'QK')
+
+        # Reconstruct to FP32, then a second pass for exp/sum and the P8 encode.
+        # m_new=max(m,colmax(P)); alpha=exp(m-m_new); l_new=alpha*l+sum(exp).
+        sm = vector(f'{tag} softmax + P8', t_qk['raw_bytes']+4*c*G+8*G,
+                    4*c*G+c*G+12*G, deps=[qk, update], free=[f'{tag}QKraw'],
+                    alloc=[(f'P8@{b}', c*G), (f'stats@{b}', 12*G)])
+
+        t_pv = _array_matmul(H, G, c, _balanced_split(H, G, c, R, hw), R, hw)
+        pk = vector(f'{tag} PV pack', (H+G)*c, t_pv['packed_bytes'],
+                    deps=[sm, dv], alloc=[(f'{tag}PVdig', t_pv['packed_bytes'])],
+                    free=[f'P8@{b}', f'V8T@{b}', f'V_scale@{b}'])
+        pv = arrays(f'{tag} PV', t_pv, pk, tag+'PV')
+
+        # U <- alpha*U + C; l <- l_new; m <- m_new.
+        update = vector(f'{tag} accumulate U,l,m', t_pv['raw_bytes']+4*H*G+12*G,
+                        4*H*G+8*G, deps=[pv, update, sm],
+                        free=[f'{tag}PVraw', f'stats@{b}'])
+
+    norm = vector('normalize + encode O16', 4*H*G+4*G, 2*G*H, deps=[update],
+                  alloc=[('O16', 2*G*H)],
+                  free=['U', 'l', 'm', 'Q8', 'Q_scale'])
+    dma('store O16', 2*G*H, 'write', deps=[norm], free=['O16'])
+    cycles = max(t['end'] for t in tasks)
+
+    # ---- replay SRAM occupancy in time order (frees, allocs, probes) ----
+    sram = SRAM(hw=hw)
+    order = []
+    for t in tasks:
+        order += [(t['start'], 1, t['id'], name, nb) for name, nb in t['alloc']]
+        order += [(t['end'], 0, t['id'], name, 0) for name in t['free']]
+        order.append((t['start'], 2, t['id'], None, 0))
+    for _, kind, tid, name, nb in sorted(order, key=lambda e: e[:3]):
+        if kind == 1:
+            sram.allocate(name, nb, 8)
+        elif kind == 0:
+            sram.free(name)
+        else:
+            tasks[tid]['used_bytes'] = sram.used_bytes
+    peak = sram.peak_bytes
+    for name in list(sram.buffers):
+        sram.free(name)
+
+    # ---- bookkeeping ------------------------------------------------------
+    counts = dict(key_blocks=len(packs), DMA=0, VCPU=0, SA1_jobs=0, SA2_jobs=0)
+    breakdown, events, steps = {}, [], []
+    for t in sorted(tasks, key=lambda t: (t['start'], t['id'])):
+        step = dict(name=t['name'], unit=t['unit'], start=t['start'],
+                    end=t['end'], cycles=t['cycles'], used_bytes=t['used_bytes'])
+        breakdown[t['unit']] = breakdown.get(t['unit'], 0) + t['cycles']
+        if t['unit'] != 'ARRAYS':
+            counts[t['unit']] += 1
+            events.append(step.copy())
+        else:
+            step['unit'] = 'SA1+SA2'
+            for a in range(2):
+                counts[f'SA{a+1}_jobs'] += t['info']['jobs'][a]
+                if t['info']['jobs'][a]:
+                    events.append(dict(name=t['name'], unit=f'SA{a+1}',
+                                       start=t['start']+t['info']['start'][a],
+                                       end=t['start']+t['info']['end'][a]))
+        steps.append(step)
+        if verbose:
+            print(f'{t["name"]:38s} {step["unit"]:7s} @{t["start"]:>9,d} '
+                  f'{t["cycles"]:8,d} cycles  SRAM {t["used_bytes"]/1024:8.2f} KiB')
+    breakdown['SA1+SA2'] = breakdown.pop('ARRAYS', 0)
+    macs = 2 * G * H * S                        # scores + output, one token
+    result = dict(cycles=cycles, time_us=hw.time_us(cycles),
+                  time_ms=hw.time_us(cycles)/1000, counts=counts,
+                  breakdown=breakdown, macs=macs,
+                  mac_per_cycle=macs/cycles,
+                  dram_bytes=2*S*H + 2*G*H + 2*G*H,   # INT8 cache + Q16 + O16
+                  utilization={u: b/cycles for u, b in breakdown.items()},
+                  steps=steps, events=events, sram=sram, peak_sram_bytes=peak,
+                  max_sram_utilization_percent=100*peak/sram.capacity_bytes,
+                  hw=hw, first_tile_end=next(t['end'] for t in tasks
+                                             if t['name'].endswith('accumulate U,l,m')),
+                  panel_titles=['Complete decode step', 'First key block'],
+                  config=dict(S=S, H=H, G=G, Bc=Bc, R=R, overlap=overlap))
+    result['title'] = (
+        f'FlashAttention decode | {hw.array_model} | {hw.control} control | '
+        f'{"overlapped engines" if overlap else "serial"}\n'
+        f'S={S}, H={H}, G={G}, Bc={Bc}, R={R} | {result["time_us"]:.2f} us | '
+        f'{result["mac_per_cycle"]:.1f} MAC/cycle | peak SRAM '
+        f'{result["max_sram_utilization_percent"]:.2f}%')
+    if verbose:
+        print(f'\nTotal: {result["time_us"]:.3f} us ({cycles:,} cycles), '
+              f'{result["mac_per_cycle"]:.1f} MAC/cycle')
+        print('Busy: ' + ', '.join(f'{u} {100*b/cycles:.1f}%'
+                                   for u, b in breakdown.items()))
+        print(f'Peak SRAM: {peak:,} bytes '
+              f'({result["max_sram_utilization_percent"]:.3f}%)')
+    if gantt_path is not None:
+        plot_flash_attention(result, gantt_path)
+    return result
+
+def flash_attention_vanilla(T=2048, S=2048, H=128, G=4, Br=128, Bc=256, R=128,
+                            causal=True, hw=Hardware(), verbose=False):
+    sram, cycles, busy = SRAM(hw=hw), 0, {'DMA': 0, 'VCPU': 0, 'SA': 0}
+    digits, pairs = hw.digits, hw.digits**2
+
+    def step(name, unit, n):
+        nonlocal cycles
+        cycles += n
+        busy[unit] += n
+        if verbose:
+            print(f'{name:38s} {unit:5s} {n:9,d} cycles  SRAM {sram.used_bytes/1024:8.1f} KiB')
+
+    def vcpu(name, reads, writes):
+        step(name, 'VCPU', VCPU(reads, writes, hw).launch_cycle())
+
+    def gemm(name, m, n, depth):
+        """CPU issues SA1/SA2 commands for the physical tiles; wait for all.
+
+        Rows split half/half; each array runs its commands back to back.
+        One command = one padded output tile x one reduction chunk x digit pair.
+        """
+        rows = [divup(m, 2), m - divup(m, 2)]
+        stream = 0
+        for sa, r in zip((SA1(compute_model=hw.array_model), SA2(compute_model=hw.array_model)), rows):
+            commands = divup(r, sa.physical_rows) * divup(n, 16) * divup(depth, R) * pairs
+            stream = max(stream, commands * sa.compute(sa.physical_rows, min(R, depth), 8, 16, hw=hw))
+        step(name, 'SA', stream)
+        return 2 * m * n * divup(depth, R) * pairs  # raw INT16 partial bytes
+
+    # DMA load K16, V16
+    step('DMA load K16', 'DMA', DMA(hw=hw).transfer((S, H), 16, 'read', sram, 'K16'))
+    step('DMA load V16', 'DMA', DMA(hw=hw).transfer((S, H), 16, 'read', sram, 'V16'))
+    # VCPU K16 -> K8, V16 -> packed transposed V8 ; SRAM write K8, V8, sK, sV
+    sram.allocate('K8', (S, H), 8); sram.allocate('V8T', (H, S), 8); sram.allocate('sKV', 2, 'fp32')
+    vcpu('VCPU quantize K,V + transpose V', 8*S*H, 2*S*H + 8)
+    sram.free('K16'); sram.free('V16')
+
+    for g in range(G):
+        for i in range(0, T, Br):                       # FOR i
+            m = min(Br, T - i)
+            step('DMA load Qi16', 'DMA', DMA(hw=hw).transfer((m, H), 16, 'read', sram, 'Q16'))
+            sram.allocate('Q8', (m, H), 8); sram.allocate('U', (m, H), 'fp32')
+            sram.allocate('l', m, 'fp32'); sram.allocate('m', m, 'fp32')
+            vcpu('VCPU Qi16 -> Qi8; init U,l,m', 4*m*H, 5*m*H + 8*m + 4)
+            sram.free('Q16')
+
+            key_end = min(S, i + m) if causal else S
+            for j in range(0, key_end, Bc):             # FOR j
+                c = min(Bc, S - j)
+                # VCPU pack Qi8, Kj8 digits
+                sram.allocate('dig', digits * (m + c) * H, 8)
+                vcpu('VCPU pack Q,K digits', (m + c) * H, digits * (m + c) * H)
+                # SA1 & SA2 compute S16 partials ; CPU wait
+                raw = gemm('SA1+SA2 S = Q K^T', m, c, H)
+                sram.allocate('raw', raw, 8); sram.free('dig')
+                # VCPU reconstruct S16 -> S_FP32
+                sram.allocate('S32', (m, c), 'fp32')
+                vcpu('VCPU reconstruct S -> FP32', raw + 8, 4*m*c)
+                sram.free('raw')
+                # VCPU softmax: mask, new_m, alpha, P, b, P8, sP
+                sram.allocate('P8', (m, c), 8); sram.allocate('stats', 3*m, 'fp32')
+                vcpu('VCPU softmax -> P8', 8*m*c + 8*m, m*c + 12*m)
+                sram.free('S32')
+                # VCPU pack P8, Vj8 digits
+                sram.allocate('dig', digits * (m + H) * c, 8)
+                vcpu('VCPU pack P,V digits', (m + H) * c, digits * (m + H) * c)
+                sram.free('P8')
+                # SA1 & SA2 compute C16 partials ; CPU wait
+                raw = gemm('SA1+SA2 C = P V', m, H, c)
+                sram.allocate('raw', raw, 8); sram.free('dig')
+                # VCPU reconstruct C16 -> C_FP32
+                sram.allocate('C32', (m, H), 'fp32')
+                vcpu('VCPU reconstruct C -> FP32', raw + 4, 4*m*H)
+                sram.free('raw')
+                # VCPU U = alpha*U + C ; l = alpha*l + b ; swap m
+                vcpu('VCPU update U,l', 8*m*H + 12*m, 4*m*H + 8*m)
+                sram.free('C32'); sram.free('stats')
+
+            # VCPU Oi = U / l -> Oi16 ; DMA store Oi16
+            sram.allocate('O16', (m, H), 16)
+            vcpu('VCPU normalize -> Oi16', 4*m*H + 4*m, 2*m*H)
+            for name in ('Q8', 'U', 'l', 'm'):
+                sram.free(name)
+            step('DMA store Oi16', 'DMA', DMA(hw=hw).transfer((m, H), 16, 'write', sram, 'O16', release=True))
+
+    for name in ('K8', 'V8T', 'sKV'):
+        sram.free(name)
+    result = dict(cycles=cycles, time_ms=hw.time_us(cycles) / 1000, busy=busy,
+                  peak_sram_bytes=sram.peak_bytes,
+                  sram_utilization_percent=100 * sram.max_utilization())
+    if verbose:
+        print(f'\nTotal {result["time_ms"]:.3f} ms; busy {busy}; '
+              f'peak SRAM {result["sram_utilization_percent"]:.2f}%')
+    return result

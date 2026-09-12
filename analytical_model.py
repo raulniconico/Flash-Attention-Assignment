@@ -1,4 +1,7 @@
+from math import ceil
+
 from helper import *
+from tile_model import *
 
 MB = 2 ** 20
 GB = 2 ** 30
@@ -252,3 +255,174 @@ def count_fa2(B=B, L=L, T=T, S=S, D=D, N=N, K=K, H=H,
     count["SA_operand_preloads_total"] = count["SA_commands_total"]
     count["SA_partial_output_writes_total"] = count["SA_commands_total"]
     return count, payload_bytes
+
+def analytical(Br_SA1, Br_SA2, Bc, R,
+               hw=Hardware(control="pipelined")):
+
+    Br = Br_SA1 + Br_SA2
+    G = N // K
+    Q_offset = 0
+
+    Digit_pairs = hw.digits**2
+
+    # Your formulas assume pipelined command issue.
+    # This helper receives TOTAL vector read + write traffic.
+    def vector_cycles(total_bytes):
+        return VCPU(
+            in_bytes=total_bytes,
+            out_bytes=0,
+            hw=hw,
+        ).launch_cycle()
+
+    # Physical array dimensions and bandwidths come from the classes.
+    sa1 = SA1(K=R, compute_model="mac")
+    sa2 = SA2(K=R, compute_model="mac")
+
+    # K/V loaded once for all G grouped Q heads.
+    DMA_K = DMA(
+        nbytes=2 * S * H, direction="read", hw=hw
+    ).cycle()
+
+    DMA_V = DMA(
+        nbytes=2 * S * H, direction="read", hw=hw
+    ).cycle()
+
+    VCPU_KV = vector_cycles(10 * S * H + 16)
+    KV_setup = DMA_K + DMA_V + VCPU_KV
+
+    Q_head_BW = 0
+    Q_head_MAC = 0
+
+    for q0 in range(0, T, Br):
+        r = min(Br, T - q0)
+        r1 = min(r, Br_SA1)
+        r2 = r - r1
+
+        Row_tiles1 = ceil(r1 / sa1.physical_rows)
+        Row_tiles2 = ceil(r2 / sa2.physical_rows)
+
+        Padded_rows = (
+            Row_tiles1 * sa1.physical_rows
+            + Row_tiles2 * sa2.physical_rows
+        )
+
+        DMA_Q = DMA(
+            nbytes=2 * r * H, direction="read", hw=hw
+        ).cycle()
+
+        DMA_O = DMA(
+            nbytes=2 * r * H, direction="write", hw=hw
+        ).cycle()
+
+        VCPU_Q = vector_cycles(9 * r * H + 8 * r + 8)
+        VCPU_O = vector_cycles(6 * r * H + 4 * r + 4)
+
+        Q_head_BW += DMA_Q + DMA_O + VCPU_Q + VCPU_O
+        Q_head_MAC += DMA_Q + DMA_O + VCPU_Q + VCPU_O
+
+        for k0 in range(0, min(S, Q_offset + q0 + r), Bc):
+            c = min(Bc, S - k0)
+
+            Softmax = vector_cycles(17 * r * c + 28 * r)
+            Update = vector_cycles(12 * r * H + 16 * r)
+
+            Q_head_BW += Softmax + Update
+            Q_head_MAC += Softmax + Update
+
+            for product, columns, reduction in [
+                ("QK", c, H),
+                ("PV", H, c),
+            ]:
+                Chunks = ceil(reduction / R)
+
+                # Preserve your fixed-depth padding.
+                Padded_reduction = Chunks * R
+
+                # Both arrays have 16 physical output columns.
+                Physical_columns = sa1.output_bytes() // (
+                    sa1.physical_rows * 2
+                )
+                Column_tiles = ceil(columns / Physical_columns)
+                Padded_columns = Column_tiles * Physical_columns
+
+                Jobs1 = Row_tiles1 * Column_tiles * Chunks * Digit_pairs
+                Jobs2 = Row_tiles2 * Column_tiles * Chunks * Digit_pairs
+
+                Raw_bytes = (
+                    Jobs1 * sa1.output_bytes()
+                    + Jobs2 * sa2.output_bytes()
+                )
+
+                Pack = vector_cycles(
+                    (r + columns) * reduction
+                    + hw.digits
+                    * (Padded_rows + Padded_columns)
+                    * Padded_reduction
+                )
+
+                Scale_bytes = 8 if product == "QK" else 4 * r + 4
+
+                Recon = vector_cycles(
+                    Raw_bytes
+                    + 4 * r * columns
+                    + Scale_bytes
+                )
+
+                # Preserve your first-command ordering.
+                Start1 = 0 if Jobs1 > Jobs2 else hw.issue_interval
+                Start2 = hw.issue_interval if Jobs1 > Jobs2 else 0
+
+                End_BW = []
+                End_MAC = []
+
+                for sa, jobs, start in [
+                    (sa1, Jobs1, Start1),
+                    (sa2, Jobs2, Start2),
+                ]:
+                    if jobs == 0:
+                        End_BW.append(0)
+                        End_MAC.append(0)
+                        continue
+
+                    Input = sa.input_cycles()
+                    Output = sa.output_cycles()
+                    Compute = sa.compute_cycles()  # R in MAC model.
+
+                    End_BW.append(
+                        start
+                        + hw.array_latency
+                        + Input
+                        + Output
+                        + (jobs - 1) * max(Input, Output)
+                    )
+
+                    End_MAC.append(
+                        start
+                        + hw.array_latency
+                        + Input
+                        + Compute
+                        + Output
+                        + (jobs - 1) * max(Input, Compute, Output)
+                    )
+
+                Q_head_BW += Pack + Recon + max(End_BW)
+                Q_head_MAC += Pack + Recon + max(End_MAC)
+
+    First_Q_DMA = DMA(
+        nbytes=2 * min(Br, T) * H,
+        direction="read",
+        hw=hw,
+    ).cycle()
+
+    Hidden_Q_DMA = min(
+        First_Q_DMA,
+        VCPU_KV - hw.vector_launch,
+    )
+
+    FA2_BW_cycles = KV_setup + G * Q_head_BW - Hidden_Q_DMA
+    FA2_MAC_cycles = KV_setup + G * Q_head_MAC - Hidden_Q_DMA
+
+    FA2_BW_ms = round(hw.time_us(FA2_BW_cycles) / 1000, 3)
+    FA2_MAC_ms = round(hw.time_us(FA2_MAC_cycles) / 1000, 3)
+
+    return FA2_BW_ms, FA2_MAC_ms
