@@ -9,17 +9,14 @@ UPDATE_LAG = 1  # U/l/m update of block p is queued after the pack work of p+1.
 
 @lru_cache(maxsize=4096)
 def _array_matmul(m, n, depth, rows_sa1, R, hw, diag=None, axis='cols'):
-    """Schedule physical jobs; return per-array completion and traffic.
+    """Schedule the physical jobs of one GEMM; return completion and traffic.
 
-    Inputs are packed as row-dot operands. Each array has one compute stage
-    and one output drain. The next compute can overlap the previous drain.
-    Commands share one CPU interface. 'pipelined' assumes timed early issue;
-    the issue interval is a user assumption, not a hardware specification.
-
-    Causal skipping: with diag given, entry (row, x) is masked when
-    x - row > diag, where x is the column (axis='cols', scores) or the
-    reduction index (axis='depth', P.V with zero probabilities). A physical
-    job is skipped when every entry it produces (or consumes) is masked.
+    Rows split m between SA1 (the first rows_sa1) and SA2. One job costs
+    command latency + stage (operands in / MACs) + output drain; the drain
+    overlaps the next stage and both arrays share one command interface
+    ('pipelined' assumes timed early issue, a user assumption). With diag
+    given, a job is skipped when every entry it produces (axis='cols',
+    scores) or consumes (axis='depth', P.V) is causally masked.
     """
     arrays = [SA1(compute_model=hw.array_model), SA2(compute_model=hw.array_model)]
     split = min(m, rows_sa1)
@@ -42,7 +39,6 @@ def _array_matmul(m, n, depth, rows_sa1, R, hw, diag=None, axis='cols'):
         stages.append(stream)
         raw_bytes += len(stream) * sa.output_bytes()
 
-    # Job = command latency + stage + output drain (SystolicArray.compute).
     advance = hw.array_latency if hw.control == 'pipelined' else 0
     interval = hw.issue_interval if hw.control == 'pipelined' else hw.array_latency
     cpu, pos, ready, drain, first = 0, [0, 0], [0, 0], [0, 0], [None, None]
@@ -75,62 +71,144 @@ def _balanced_split(m, n, depth, R, hw, diag=None, axis='cols'):
     return best[2]
 
 
+class _Queue:
+    """Three in-order engine queues: DMA, VCPU and the SA1+SA2 command pair.
+
+    A command starts when its engine is free and every producer it depends on
+    has finished. overlap=False also chains each command to the previous one,
+    i.e. the fully serial schedule. Every task declares deps/alloc/free, so
+    the schedule alone determines SRAM occupancy (see _replay_sram).
+    """
+    def __init__(self, hw, overlap=True):
+        self.hw, self.overlap = hw, overlap
+        self.tasks, self.free_at = [], {'DMA': 0, 'VCPU': 0, 'ARRAYS': 0}
+
+    def task(self, name, unit, duration, deps=(), alloc=(), free=(), info=None):
+        deps = [d for d in deps if d is not None]
+        if not self.overlap and self.tasks:
+            deps.append(self.tasks[-1]['id'])
+        start = max([self.free_at[unit]] + [self.tasks[d]['end'] for d in deps])
+        rec = dict(id=len(self.tasks), name=name, unit=unit, start=start,
+                   end=start+duration, cycles=duration, deps=deps,
+                   alloc=list(alloc), free=list(free), info=info)
+        self.free_at[unit] = rec['end']
+        self.tasks.append(rec)
+        return rec['id']
+
+    def vector(self, name, reads, writes, **kw):
+        return self.task(name, 'VCPU', VCPU(reads, writes, self.hw).launch_cycle(), **kw)
+
+    def dma(self, name, nbytes, direction, **kw):
+        return self.task(name, 'DMA', DMA(nbytes, direction, self.hw).cycle(), **kw)
+
+    def arrays(self, name, timing, dep, raw, dig):
+        """One GEMM on the shared command interface; frees its packed operands."""
+        return self.task(name, 'ARRAYS', max(timing['end']), deps=[dep],
+                         alloc=[(raw, timing['raw_bytes'])], free=[dig], info=timing)
+
+
+def _replay_sram(tasks, hw):
+    """Replay the timed allocs/frees; record used_bytes per task, return peak.
+
+    Buffers of in-flight blocks coexist, so occupancy follows the schedule and
+    not the emission order. Over-subscription raises MemoryError.
+    """
+    sram = SRAM(hw=hw)
+    order = []
+    for t in tasks:
+        order += [(t['start'], 1, t['id'], name, nb) for name, nb in t['alloc']]
+        order += [(t['end'], 0, t['id'], name, 0) for name in t['free']]
+        order.append((t['start'], 2, t['id'], None, 0))
+    for _, kind, tid, name, nb in sorted(order, key=lambda e: e[:3]):
+        if kind == 1:
+            sram.allocate(name, nb, 8)
+        elif kind == 0:
+            sram.free(name)
+        else:
+            tasks[tid]['used_bytes'] = sram.used_bytes
+    peak = sram.peak_bytes
+    for name in list(sram.buffers):
+        sram.free(name)
+    return sram, peak
+
+
+def _summarize(tasks, counts, hw, verbose):
+    """Busy cycles per queue, job counts, Gantt events and the step table."""
+    breakdown, events, steps = {}, [], []
+    for t in sorted(tasks, key=lambda t: (t['start'], t['id'])):
+        step = dict(name=t['name'], unit=t['unit'], start=t['start'], end=t['end'],
+                    cycles=t['cycles'], used_bytes=t['used_bytes'])
+        timing = t['info']
+        if t['unit'] != 'ARRAYS':
+            counts[t['unit']] += 1
+            breakdown[t['unit']] = breakdown.get(t['unit'], 0) + t['cycles']
+            events.append(step.copy())
+        else:
+            step['unit'] = 'SA1+SA2'
+            breakdown['SA1+SA2'] = breakdown.get('SA1+SA2', 0) + t['cycles']
+            counts['skipped_jobs'] += timing['skipped']
+            for a in range(2):
+                counts[f'SA{a+1}_jobs'] += timing['jobs'][a]
+                if timing['jobs'][a]:
+                    events.append(dict(name=t['name'], unit=f'SA{a+1}',
+                                       start=t['start']+timing['start'][a],
+                                       end=t['start']+timing['end'][a]))
+        steps.append(step)
+        if verbose:
+            print(f'{t["name"]:42s} {t["unit"]:6s} @{t["start"]:>11,d} '
+                  f'{t["cycles"]:9,d} cycles {hw.time_us(t["cycles"]):9.3f} us  '
+                  f'SRAM {t["used_bytes"]/1024:9.2f} KiB')
+            if t['unit'] == 'ARRAYS':
+                for a in range(2):
+                    if timing['jobs'][a]:
+                        elapsed = timing['end'][a] - timing['start'][a]
+                        print(f'  SA{a+1}: {timing["jobs"][a]:,} commands '
+                              f'({timing["rows_sa1"] if a == 0 else "rest"} rows), '
+                              f'{elapsed:,} cycles ({hw.time_us(elapsed):.3f} us); '
+                              f'starts +{timing["start"][a]} cycles in GEMM')
+    return breakdown, events, steps
+
+
+def _report(result, verbose):
+    """Print the totals shared by both kernels and return the result dict."""
+    if verbose:
+        cycles, sram = result['cycles'], result['sram']
+        print(f'\nTotal: {result["time_ms"]:.6f} ms ({cycles:,} cycles)')
+        print('Busy: ' + ', '.join(f'{u} {100*b/cycles:.1f}%'
+                                   for u, b in result['breakdown'].items()))
+        print(f'Peak SRAM: {result["peak_sram_bytes"]:,} bytes '
+              f'({result["max_sram_utilization_percent"]:.3f}%)')
+    return result
+
+
 def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
                     Br_sa1=None, R=128, causal=True, q_offset=0,
                     hw=Hardware(), overlap=True, skip_masked=True,
                     verbose=True, gantt_path=None):
-    """Time ONE KV-head group in ONE layer and ONE batch element.
+    """Time ONE KV-head group of prefill, in ONE layer and ONE batch element.
 
-    G Q heads share K/V, which are read/quantized once and kept in SRAM.
-    For the whole model, serial group count = B * L * K (K = KV heads).
-    Here R is the array reduction chunk, not the number of KV heads.
-    Tail blocks are supported. Causal positions: key <= q_offset + query.
+    G Q heads share K/V, read and quantized once into SRAM; for the whole
+    model the serial group count is B * L * K (K = KV heads). R is the array
+    reduction chunk. Causal positions: key <= q_offset + query; short tail
+    blocks are supported.
 
-    Execution model. The control CPU only issues commands; DMA, the vector
-    CPU and the array pair (SA1+SA2 interleaved on the shared command
-    interface) are three engines with in-order queues. A command starts
-    when its engine is free and every producer it depends on has finished
-    (event-based ordering). With overlap=False each command also waits for
-    the previous one, i.e. the fully serial schedule of the earlier model.
+    Pipeline (overlap=True) over the (query tile, key block) pairs p: the
+    arrays run QK(p+QK_LEAD) before PV(p), the vector CPU packs QK operands
+    PACK_LOOKAHEAD blocks ahead and lags the U/l/m update by UPDATE_LAG, so
+    softmax hides under the score GEMMs and the in-order vector queue never
+    stalls on PV(p). K is quantized before V, Q of the next tile is
+    prefetched into a second buffer, and O16 stores overlap the next tile.
 
-    Software pipeline (overlap=True), for the global sequence of
-    (query tile, key block) pairs p:
-        arrays : QK(p+QK_LEAD) is queued before PV(p), so the softmax of
-                 block p is hidden under QK_LEAD score GEMMs (short causal
-                 diagonal blocks included); PV lags QK_LEAD key blocks.
-        vector : per block p: reconstruct/softmax/pack P(p), pack the QK
-                 operands of p+PACK_LOOKAHEAD, then reconstruct/update
-                 U,l,m of block p-UPDATE_LAG (so the in-order vector queue
-                 does not stall on PV(p) before packing the next blocks).
-                 Q of the next tile is loaded and quantized when its first
-                 pack is issued (two Q16 buffers).
-        setup  : K is quantized first so QK(0) can start; V is converted
-                 while QK(0) runs; O16 stores overlap the next tile.
-    Data dependencies are explicit; row statistics chain per tile.
+    Work split. Br_sa1 rows of every GEMM go to SA1 and the rest to SA2;
+    None picks, per geometry, the multiple of 16 minimizing the two-array
+    makespan. With skip_masked, causal blocks are trimmed to 16-column
+    granularity and fully masked jobs are skipped.
 
-    Array work split. Br_sa1 rows of every GEMM go to SA1 and the rest to
-    SA2. Br_sa1=None picks, per GEMM geometry, the multiple of 16 that
-    minimizes the two-array makespan (this also balances the causal
-    diagonal blocks and tail tiles). Causal blocks are trimmed to the
-    needed columns (16-column granularity) and physical jobs whose whole
-    output (QK) or whole P input (PV) is masked are skipped when
-    skip_masked is set; the VCPU traffic shrinks with the block width.
-
-    safe-int8: quantize A16 to A8, then pack two signed base-16 digits,
-    four products and INT32 reconstruction, reduction <=128. Digit operands
-    have magnitude <=15; raw INT16 partials are safe. native-int8 is only a
-    timing comparison and requires a suitable hardware output mechanism.
-    Scaled INT16 inputs have known external scales. Q/K/V use scalar INT8
-    scales; P uses fixed 1/127. Final INT16 uses a caller-supplied output scale.
-
-    VCPU routines fuse row operations with row data kept in vector registers;
-    byte counts below explicitly state passes. V transpose is fused with
-    conversion. Packed operands duplicate the right operand across arrays;
-    full physical raw outputs are retained until reconstruction. Registers
-    and unknown array-local storage are excluded from SRAM utilization.
-    SRAM occupancy is replayed from the timed schedule (buffers of
-    in-flight blocks coexist). This executes metadata and timing only,
-    not numerical attention.
+    Quantization. safe-int8 packs two signed base-16 digit planes per operand
+    (four products, reduction <= 128); native-int8 is a timing comparison that
+    assumes a suitable output mechanism. Q/K/V use scalar INT8 scales, P a
+    fixed 1/127. VCPU byte formulas state their passes explicitly. Timing and
+    metadata only: no numerical attention.
     """
     for value in (T, S, H, G, Br, Bc, R):
         if not isinstance(value, int) or value <= 0:
@@ -165,33 +243,14 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
     P = len(pairs)
     last_pair_of_tile = {pr['tile']: p for p, pr in enumerate(pairs)}
 
-    # ---- in-order engine queues -----------------------------------------
-    tasks = []
-    unit_free = {'DMA': 0, 'VCPU': 0, 'ARRAYS': 0}
-
-    def task(name, unit, duration, deps=(), alloc=(), free=(), info=None):
-        deps = [d for d in deps if d is not None]
-        if not overlap and tasks:
-            deps.append(tasks[-1]['id'])
-        start = max([unit_free[unit]] + [tasks[d]['end'] for d in deps])
-        rec = dict(id=len(tasks), name=name, unit=unit, start=start,
-                   end=start+duration, cycles=duration, deps=deps,
-                   alloc=list(alloc), free=list(free), info=info)
-        unit_free[unit] = rec['end']
-        tasks.append(rec)
-        return rec['id']
-
-    def vector(name, reads, writes, **kw):
-        return task(name, 'VCPU', VCPU(reads, writes, hw).launch_cycle(), **kw)
-
-    def dma(name, shape, direction, **kw):  # all DRAM tensors are 16-bit
-        return task(name, 'DMA', DMA(hw=hw).transfer(shape, 16, direction), **kw)
+    q = _Queue(hw, overlap)
+    tasks = q.tasks
 
     # K/V loaded once for all G query heads.
-    dK = dma('Load K16', (S,H), 'read', alloc=[('K16', 2*S*H)])
-    qK = vector('Quantize K', 4*S*H, S*H+4, deps=[dK],  # Two A16 reads.
-                alloc=[('K8', S*H), ('K_scale', 4)], free=['K16'])
-    dV = dma('Load V16', (S,H), 'read', alloc=[('V16', 2*S*H)])
+    dK = q.dma('Load K16', 2*S*H, 'read', alloc=[('K16', 2*S*H)])
+    qK = q.vector('Quantize K', 4*S*H, S*H+4, deps=[dK],  # Two A16 reads.
+                  alloc=[('K8', S*H), ('K_scale', 4)], free=['K16'])
+    dV = q.dma('Load V16', 2*S*H, 'read', alloc=[('V16', 2*S*H)])
 
     tile_ready, packed, qk_done, pv_done = {}, {}, {}, {}
     prev_softmax, prev_update = {}, {}
@@ -201,9 +260,9 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
             return
         g, i, m = tiles[t]
         tag = f'h{g} q{i}'
-        d = dma(tag+' load Q16', (m,H), 'read', deps=[tile_ready.get(t-1)],
-                alloc=[(f'Q16@t{t}', 2*m*H)])
-        tile_ready[t] = vector(
+        d = q.dma(tag+' load Q16', 2*m*H, 'read', deps=[tile_ready.get(t-1)],
+                  alloc=[(f'Q16@t{t}', 2*m*H)])
+        tile_ready[t] = q.vector(
             tag+' quantize Q + init U,l,m', 4*m*H, 5*m*H+8*m+4, deps=[d],
             alloc=[(f'Q8@t{t}', m*H), (f'Q_scale@t{t}', 4), (f'U@t{t}', 4*m*H),
                    (f'l@t{t}', 4*m), (f'm@t{t}', 4*m)],
@@ -218,371 +277,186 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
         timing = _array_matmul(m, c, H, split(m, c, H, pr['diag'], 'cols'),
                                R, hw, pr['diag'], 'cols')
         # Read each logical operand once; write digit planes including padding.
-        pid = vector(pr['tag']+' QK pack', (m+c)*H, timing['packed_bytes'],
-                     deps=[tile_ready[pr['tile']], qK],
-                     alloc=[(f'QKdig@{p}', timing['packed_bytes'])])
+        pid = q.vector(pr['tag']+' QK pack', (m+c)*H, timing['packed_bytes'],
+                       deps=[tile_ready[pr['tile']], qK],
+                       alloc=[(f'QKdig@{p}', timing['packed_bytes'])])
         packed[p] = (pid, timing)
-
-    def emit_arrays(p, op, timing, dep):
-        return task(pairs[p]['tag']+' '+op, 'ARRAYS', max(timing['end']),
-                    deps=[dep], alloc=[(f'{op}raw@{p}', timing['raw_bytes'])],
-                    free=[f'{op}dig@{p}'], info=timing)
 
     def emit_qk(p):
         emit_pack(p)  # already packed ahead when overlapping
         pid, timing = packed[p]
-        qk_done[p] = emit_arrays(p, 'QK', timing, pid)
+        qk_done[p] = q.arrays(pairs[p]['tag']+' QK', timing, pid,
+                              f'QKraw@{p}', f'QKdig@{p}')
 
     def emit_softmax_pv(p):
         pr = pairs[p]
         t, m, c, tag = pr['tile'], pr['m'], pr['c'], pr['tag']
-        raw_qk = packed[p][1]['raw_bytes']
         # Reconstruct in vector registers, discard padding, then scale to FP32.
-        rec = vector(tag+' QK reconstruct', raw_qk+8, 4*m*c, deps=[qk_done[p]],
-                     alloc=[(f'scores@{p}', 4*m*c)], free=[f'QKraw@{p}'])
+        rec = q.vector(tag+' QK reconstruct', packed[p][1]['raw_bytes']+8, 4*m*c,
+                       deps=[qk_done[p]], alloc=[(f'scores@{p}', 4*m*c)],
+                       free=[f'QKraw@{p}'])
         # Two FP32 score reads: rowmax, then exp/sum/P8 encoding.
         # m_new=max(m,rowmax(S)); alpha=exp(m-m_new).
         # l_new=alpha*l+sum(exp(S-m_new)); masked P entries are zero.
-        sm = vector(tag+' softmax + P8', 8*m*c+8*m, m*c+12*m,
-                    deps=[rec, prev_softmax.get(t)],
-                    alloc=[(f'P8@{p}', m*c), (f'stats@{p}', 12*m)],
-                    free=[f'scores@{p}'])
+        sm = q.vector(tag+' softmax + P8', 8*m*c+8*m, m*c+12*m,
+                      deps=[rec, prev_softmax.get(t)],
+                      alloc=[(f'P8@{p}', m*c), (f'stats@{p}', 12*m)],
+                      free=[f'scores@{p}'])
         prev_softmax[t] = sm
         timing = _array_matmul(m, H, c, split(m, H, c, pr['diag'], 'depth'),
                                R, hw, pr['diag'], 'depth')
-        pk = vector(tag+' PV pack', (m+H)*c, timing['packed_bytes'],
-                    deps=[sm, qV], alloc=[(f'PVdig@{p}', timing['packed_bytes'])],
-                    free=[f'P8@{p}'])
+        pk = q.vector(tag+' PV pack', (m+H)*c, timing['packed_bytes'],
+                      deps=[sm, qV], alloc=[(f'PVdig@{p}', timing['packed_bytes'])],
+                      free=[f'P8@{p}'])
         return pk, timing
 
     def emit_update(p):
         pr = pairs[p]
         t, m, tag = pr['tile'], pr['m'], pr['tag']
-        raw_pv = tasks[pv_done[p]]['info']['raw_bytes']
-        rec = vector(tag+' PV reconstruct', raw_pv+4, 4*m*H, deps=[pv_done[p]],
-                     alloc=[(f'C@{p}', 4*m*H)], free=[f'PVraw@{p}'])
+        rec = q.vector(tag+' PV reconstruct', tasks[pv_done[p]]['info']['raw_bytes']+4,
+                       4*m*H, deps=[pv_done[p]], alloc=[(f'C@{p}', 4*m*H)],
+                       free=[f'PVraw@{p}'])
         # U <- alpha*U + C; l <- l_new; m <- m_new.
-        prev_update[t] = vector(tag+' update U,l,m', 8*m*H+12*m, 4*m*H+8*m,
-                                deps=[rec, prev_update.get(t), prev_softmax[t]],
-                                free=[f'C@{p}', f'stats@{p}'])
+        prev_update[t] = q.vector(tag+' update U,l,m', 8*m*H+12*m, 4*m*H+8*m,
+                                  deps=[rec, prev_update.get(t), prev_softmax[t]],
+                                  free=[f'C@{p}', f'stats@{p}'])
         if last_pair_of_tile[t] == p:
             g, i, m = tiles[t]
             ttag = f'h{g} q{i}'
-            norm = vector(ttag+' normalize + encode O16', 4*m*H+4*m, 2*m*H,
-                          deps=[prev_update[t]], alloc=[(f'O16@t{t}', 2*m*H)],
-                          free=[f'Q8@t{t}', f'Q_scale@t{t}', f'U@t{t}',
-                                f'l@t{t}', f'm@t{t}'])
-            dma(ttag+' store O16', (m,H), 'write', deps=[norm],
-                free=[f'O16@t{t}'])
+            norm = q.vector(ttag+' normalize + encode O16', 4*m*H+4*m, 2*m*H,
+                            deps=[prev_update[t]], alloc=[(f'O16@t{t}', 2*m*H)],
+                            free=[f'Q8@t{t}', f'Q_scale@t{t}', f'U@t{t}',
+                                  f'l@t{t}', f'm@t{t}'])
+            q.dma(ttag+' store O16', 2*m*H, 'write', deps=[norm],
+                  free=[f'O16@t{t}'])
 
     # Serial schedule = the same loop with no lead, lookahead or lag.
     lead, ahead, lag = (QK_LEAD, PACK_LOOKAHEAD, UPDATE_LAG) if overlap else (0, 0, 0)
-    for q in range(ahead):
-        emit_pack(q)
-    for q in range(min(lead, P)):
-        emit_qk(q)
-    qV = vector('Quantize V + transpose', 4*S*H, S*H+4, deps=[dV],
-                alloc=[('V8T', S*H), ('V_scale', 4)], free=['V16'])
+    for p in range(ahead):
+        emit_pack(p)
+    for p in range(min(lead, P)):
+        emit_qk(p)
+    qV = q.vector('Quantize V + transpose', 4*S*H, S*H+4, deps=[dV],
+                  alloc=[('V8T', S*H), ('V_scale', 4)], free=['V16'])
     for p in range(P):
         if p+lead < P:
             emit_qk(p+lead)
         pk, timing = emit_softmax_pv(p)
         emit_pack(p+ahead)
-        pv_done[p] = emit_arrays(p, 'PV', timing, pk)
+        pv_done[p] = q.arrays(pairs[p]['tag']+' PV', timing, pk,
+                              f'PVraw@{p}', f'PVdig@{p}')
         if p >= lag:
             emit_update(p-lag)
     for p in range(max(0, P-lag), P):
         emit_update(p)
-    kv_setup_cycles = tasks[qV]['end']
     cycles = max(t['end'] for t in tasks)
 
-    # ---- replay SRAM occupancy in time order (frees, allocs, probes) ----
-    sram = SRAM(hw=hw)
-    order = []
-    for t in tasks:
-        order += [(t['start'], 1, t['id'], name, nb) for name, nb in t['alloc']]
-        order += [(t['end'], 0, t['id'], name, 0) for name in t['free']]
-        order.append((t['start'], 2, t['id'], None, 0))
-    for _, kind, tid, name, nb in sorted(order, key=lambda e: e[:3]):
-        if kind == 1:
-            sram.allocate(name, nb, 8)
-        elif kind == 0:
-            sram.free(name)
-        else:
-            tasks[tid]['used_bytes'] = sram.used_bytes
-    peak = sram.peak_bytes
-    for name in list(sram.buffers):
-        sram.free(name)
-
-    # ---- bookkeeping ------------------------------------------------------
+    sram, peak = _replay_sram(tasks, hw)
     counts = dict(query_tiles=len(tiles), pairs=P, DMA=0, VCPU=0,
                   SA1_jobs=0, SA2_jobs=0, skipped_jobs=0)
-    breakdown, events, steps = {}, [], []
-    for t in sorted(tasks, key=lambda t: (t['start'], t['id'])):
-        step = dict(name=t['name'], unit=t['unit'], start=t['start'], end=t['end'],
-                    cycles=t['cycles'], used_bytes=t['used_bytes'])
-        if t['unit'] != 'ARRAYS':
-            counts[t['unit']] += 1
-            breakdown[t['unit']] = breakdown.get(t['unit'], 0) + t['cycles']
-            events.append(step.copy())
-        else:
-            timing = t['info']
-            step['unit'] = 'SA1+SA2'
-            breakdown['SA1+SA2'] = breakdown.get('SA1+SA2', 0) + t['cycles']
-            counts['skipped_jobs'] += timing['skipped']
-            for a in range(2):
-                counts[f'SA{a+1}_jobs'] += timing['jobs'][a]
-                if timing['jobs'][a]:
-                    events.append(dict(name=t['name'], unit=f'SA{a+1}',
-                                       start=t['start']+timing['start'][a],
-                                       end=t['start']+timing['end'][a]))
-        steps.append(step)
-        if verbose:
-            print(f'{t["name"]:42s} {t["unit"]:6s} @{t["start"]:>11,d} '
-                  f'{t["cycles"]:9,d} cycles {hw.time_us(t["cycles"]):9.3f} us  '
-                  f'SRAM {t["used_bytes"]/1024:9.2f} KiB')
-            if t['unit'] == 'ARRAYS':
-                timing = t['info']
-                for a in range(2):
-                    if timing['jobs'][a]:
-                        elapsed = timing['end'][a] - timing['start'][a]
-                        print(f'  SA{a+1}: {timing["jobs"][a]:,} commands '
-                              f'({timing["rows_sa1"] if a == 0 else "rest"} rows), '
-                              f'{elapsed:,} cycles ({hw.time_us(elapsed):.3f} us); '
-                              f'starts +{timing["start"][a]} cycles in GEMM')
-    first_tile_end = next(t['end'] for t in tasks if t['name'].endswith('store O16'))
+    breakdown, events, steps = _summarize(tasks, counts, hw, verbose)
     full = pairs[0]
     result = dict(cycles=cycles, time_us=hw.time_us(cycles),
-                  time_ms=hw.time_us(cycles)/1000, kv_setup_cycles=kv_setup_cycles,
-                  query_work_cycles=cycles-kv_setup_cycles, counts=counts,
+                  time_ms=hw.time_us(cycles)/1000,
+                  kv_setup_cycles=tasks[qV]['end'],
+                  query_work_cycles=cycles-tasks[qV]['end'], counts=counts,
                   breakdown=breakdown,
                   utilization={u: b/cycles for u, b in breakdown.items()},
                   steps=steps, events=events, sram=sram, peak_sram_bytes=peak,
                   max_sram_utilization_percent=100*peak/sram.capacity_bytes,
-                  first_tile_end=first_tile_end, hw=hw,
+                  first_tile_end=next(t['end'] for t in tasks
+                                      if t['name'].endswith('store O16')),
+                  hw=hw,
                   config=dict(T=T,S=S,H=H,G=G,Br=Br,Bc=Bc,Br_sa1=Br_sa1,R=R,
                               overlap=overlap, skip_masked=skip_masked,
                               split_qk=split(full['m'], full['c'], H, None, 'cols'),
                               split_pv=split(full['m'], H, full['c'], None, 'depth')))
-    if verbose:
-        print(f'\nTotal: {result["time_ms"]:.6f} ms ({cycles:,} cycles)')
-        print('Busy: ' + ', '.join(f'{u} {100*b/cycles:.1f}%'
-                                    for u, b in breakdown.items()))
-        print(f'Peak SRAM: {peak:,} bytes ({100*peak/sram.capacity_bytes:.3f}%)')
+    _report(result, verbose)
     if gantt_path is not None:
         plot_flash_attention(result, gantt_path)
     return result
 
 
-def plot_flash_attention(result, path):
-    """Save a Gantt PNG; matplotlib is only needed when plotting.
-
-    Array bars are stream envelopes including command gaps and draining,
-    not claims of continuous arithmetic. Zoom shows cold setup + first Q tile
-    (or result['zoom_end']); result['title'] / ['panel_titles'] override text.
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-    import re
-
-    hw, cfg = result['hw'], result['config']
-    colors = {'DMA':'#4979b6', 'VCPU':'#dd9338', 'SA1':'#329b80', 'SA2':'#8965ba'}
-    lanes = list(colors)
-    zoom_end = result.get('zoom_end', result['first_tile_end'])
-    zoom_events = sorted((e for e in result['events'] if e['start'] < zoom_end),
-                         key=lambda e: (e['start'], lanes.index(e['unit'])))
-    ncol, per_col = 3, -(-len(zoom_events) // 3)
-    fig, axes = plt.subplots(3, 1, figsize=(15, 11 + 0.16*per_col),
-                             height_ratios=[2, 3, 0.18*per_col + 0.4],
-                             layout='constrained')
-    panel_titles = result.get('panel_titles',
-                              ['Complete KV-head group', 'Cold setup + first query tile'])
-    for ax, end, title, zoom in zip(axes[:2], [result['cycles'], zoom_end],
-                                    panel_titles, [False, True]):
-        shown = [e for e in result['events'] if e['start'] < end]
-        if not zoom:  # one bar collection per lane: fast for long schedules
-            for unit in lanes:
-                ranges = [(hw.time_us(e['start']),
-                           hw.time_us(min(e['end'], end)-e['start']))
-                          for e in shown if e['unit'] == unit]
-                ax.broken_barh(ranges, (lanes.index(unit)-0.35, 0.7),
-                               facecolors=colors[unit], edgecolors='white',
-                               linewidth=0.35)
-            shown = []
-        for e in shown:
-            x = hw.time_us(e['start'])
-            width = hw.time_us(min(e['end'], end)-e['start'])
-            y = lanes.index(e['unit'])
-            ax.broken_barh([(x, width)], (y-0.35, 0.7), facecolors=colors[e['unit']],
-                           edgecolors='white', linewidth=0.35)
-            # Zoom panel: wide blocks carry task + cycles; every block carries
-            # its index into the table below.
-            k = zoom_events.index(e) + 1
-            cyc = e['end']-e['start']
-            if width > hw.time_us(end)*0.08:
-                label = re.sub(r'^h\d+ ', '', e['name'])
-                ax.text(x+width/2, y, f'[{k}] {label}\n{cyc:,} cyc', ha='center',
-                        va='center', fontsize=7.5, color='white')
-            elif width > hw.time_us(end)*0.012:
-                ax.text(x+width/2, y, str(k), ha='center', va='center',
-                        fontsize=6.5, color='white')
-            else:
-                ax.text(x+width/2, y-0.37, str(k), ha='center', va='bottom',
-                        fontsize=6, color=colors[e['unit']])
-        ax.set_yticks(range(4), lanes)
-        ax.invert_yaxis()
-        ax.set_xlim(0, hw.time_us(end))
-        ax.set_xlabel('Time (microseconds)')
-        ax.set_title(title, loc='left')
-        ax.grid(axis='x', alpha=0.2)
-    tab = axes[2]
-    tab.axis('off')
-    for k, e in enumerate(zoom_events):
-        col, row = divmod(k, per_col)
-        tab.text(col/ncol, 1 - row/per_col,
-                 f'[{k+1:>2}] {e["unit"]:4s} @{hw.time_us(e["start"]):7.2f} us  '
-                 f'{e["end"]-e["start"]:7,d} cyc  {e["name"]}',
-                 transform=tab.transAxes, fontsize=7, family='monospace',
-                 va='top', color=colors[e['unit']])
-    mode = 'overlapped engines' if cfg['overlap'] else 'serial'
-    title = result.get('title') or (
-        f'FlashAttention | {hw.array_model} | {hw.control} control | {mode}\n'
-        f'T={cfg["T"]}, S={cfg["S"]}, H={cfg["H"]}, G={cfg["G"]}, '
-        f'Br={cfg["Br"]}, Bc={cfg["Bc"]}, R={cfg["R"]}, '
-        f'SA1 rows QK/PV={cfg["split_qk"]}/{cfg["split_pv"]} | '
-        f'{result["time_ms"]:.3f} ms | peak SRAM '
-        f'{result["max_sram_utilization_percent"]:.2f}%')
-    fig.suptitle(title, fontsize=13)
-    fig.legend(handles=[Patch(color=c, label=u) for u,c in colors.items()],
-               loc='outside lower center', ncol=4)
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-
-def flash_decode(S=2048, H=128, G=4, Bc=256, R=256, hw=Hardware(),
+def flash_decode(S=2048, H=128, G=4, Bc=2048, R=256, hw=Hardware(),
                  overlap=True, verbose=True, gantt_path=None):
+    """Time ONE decode step of ONE KV-head group: G query heads, one token each.
 
+    For the whole model, serial group count = B * L * K per generated token.
+    Three changes make the prefill kernel fit decode:
+
+    1. Orientation. With only G query rows the prefill layout leaves one array
+       idle, so the LONG dimension drives the rows instead:
+           scores  P[c,G] = K8[c,H]  . Q8[H,G]    rows = the c keys
+           output  O[H,G] = V8T[H,c] . P8[c,G]    rows = the head dimension
+       The G queries still fill G of the 16 output columns of every job, the
+       irreducible cost of one token per sequence.
+    2. KV cache. It holds INT8 K and pre-transposed INT8 V with per-block
+       scales, so a block is used straight from DRAM: no quantize pass, half
+       the bytes. Blocks stream with a two-block prefetch.
+    3. Softmax. m, l and the FP32 accumulator U[H,G] are updated once per key
+       block; the last update normalizes and stores O16.
+    """
     for value in (S, H, G, Bc, R):
         if not isinstance(value, int) or value <= 0:
             raise ValueError('S, H, G, Bc and R must be positive integers')
 
-    tasks = []
-    unit_free = {'DMA': 0, 'VCPU': 0, 'ARRAYS': 0}
-
-    def task(name, unit, duration, deps=(), alloc=(), free=(), info=None):
-        deps = [d for d in deps if d is not None]
-        if not overlap and tasks:
-            deps.append(tasks[-1]['id'])
-        start = max([unit_free[unit]] + [tasks[d]['end'] for d in deps])
-        rec = dict(id=len(tasks), name=name, unit=unit, start=start,
-                   end=start+duration, cycles=duration, deps=deps,
-                   alloc=list(alloc), free=list(free), info=info)
-        unit_free[unit] = rec['end']
-        tasks.append(rec)
-        return rec['id']
-
-    def vector(name, reads, writes, **kw):
-        return task(name, 'VCPU', VCPU(reads, writes, hw).launch_cycle(), **kw)
-
-    def dma(name, nbytes, direction, **kw):
-        return task(name, 'DMA', DMA(nbytes, direction, hw).cycle(), **kw)
-
-    def arrays(name, timing, dep, tag):
-        return task(name, 'ARRAYS', max(timing['end']), deps=[dep],
-                    alloc=[(f'{tag}raw', timing['raw_bytes'])],
-                    free=[f'{tag}dig'], info=timing)
+    q = _Queue(hw, overlap)
+    tasks = q.tasks
 
     # Q of this step: G rows, transposed to (H,G) for the column operand.
-    dQ = dma('Load Q16', 2*G*H, 'read', alloc=[('Q16', 2*G*H)])
-    qQ = vector('Quantize Q + transpose, init U,l,m', 4*G*H, G*H+4*H*G+8*G+4,
-                deps=[dQ], free=['Q16'],
-                alloc=[('Q8', G*H), ('Q_scale', 4), ('U', 4*H*G),
-                       ('l', 4*G), ('m', 4*G)])
+    dQ = q.dma('Load Q16', 2*G*H, 'read', alloc=[('Q16', 2*G*H)])
+    qQ = q.vector('Quantize Q + transpose, init U,l,m', 4*G*H, G*H+4*H*G+8*G+4,
+                  deps=[dQ], free=['Q16'],
+                  alloc=[('Q8', G*H), ('Q_scale', 4), ('U', 4*H*G),
+                         ('l', 4*G), ('m', 4*G)])
 
     packs, update = {}, None
     for b, j in enumerate(range(0, S, Bc)):
         c, tag = min(Bc, S-j), f'k{j}'
         # INT8 cache blocks; load b waits for the pack of b-2 (two slots).
-        dk = dma(f'{tag} load K8', c*H, 'read', deps=[packs.get(b-2)],
-                 alloc=[(f'K8@{b}', c*H), (f'K_scale@{b}', 4)])
-        dv = dma(f'{tag} load V8T', c*H, 'read', deps=[packs.get(b-2)],
-                 alloc=[(f'V8T@{b}', c*H), (f'V_scale@{b}', 4)])
+        dk = q.dma(f'{tag} load K8', c*H, 'read', deps=[packs.get(b-2)],
+                   alloc=[(f'K8@{b}', c*H), (f'K_scale@{b}', 4)])
+        dv = q.dma(f'{tag} load V8T', c*H, 'read', deps=[packs.get(b-2)],
+                   alloc=[(f'V8T@{b}', c*H), (f'V_scale@{b}', 4)])
 
         t_qk = _array_matmul(c, G, H, _balanced_split(c, G, H, R, hw), R, hw)
         # Read each logical operand once; write digit planes including padding.
-        packs[b] = vector(f'{tag} QK pack', (c+G)*H, t_qk['packed_bytes'],
-                          deps=[dk, qQ], free=[f'K8@{b}', f'K_scale@{b}'],
-                          alloc=[(f'{tag}QKdig', t_qk['packed_bytes'])])
-        qk = arrays(f'{tag} QK', t_qk, packs[b], tag+'QK')
+        packs[b] = q.vector(f'{tag} QK pack', (c+G)*H, t_qk['packed_bytes'],
+                            deps=[dk, qQ], free=[f'K8@{b}', f'K_scale@{b}'],
+                            alloc=[(f'{tag}QKdig', t_qk['packed_bytes'])])
+        qk = q.arrays(f'{tag} QK', t_qk, packs[b], f'{tag}QKraw', f'{tag}QKdig')
 
         # Reconstruct to FP32, then a second pass for exp/sum and the P8 encode.
         # m_new=max(m,colmax(P)); alpha=exp(m-m_new); l_new=alpha*l+sum(exp).
-        sm = vector(f'{tag} softmax + P8', t_qk['raw_bytes']+4*c*G+8*G,
-                    4*c*G+c*G+12*G, deps=[qk, update], free=[f'{tag}QKraw'],
-                    alloc=[(f'P8@{b}', c*G), (f'stats@{b}', 12*G)])
+        sm = q.vector(f'{tag} softmax + P8', t_qk['raw_bytes']+4*c*G+8*G,
+                      4*c*G+c*G+12*G, deps=[qk, update], free=[f'{tag}QKraw'],
+                      alloc=[(f'P8@{b}', c*G), (f'stats@{b}', 12*G)])
 
         t_pv = _array_matmul(H, G, c, _balanced_split(H, G, c, R, hw), R, hw)
-        pk = vector(f'{tag} PV pack', (H+G)*c, t_pv['packed_bytes'],
-                    deps=[sm, dv], alloc=[(f'{tag}PVdig', t_pv['packed_bytes'])],
-                    free=[f'P8@{b}', f'V8T@{b}', f'V_scale@{b}'])
-        pv = arrays(f'{tag} PV', t_pv, pk, tag+'PV')
+        pk = q.vector(f'{tag} PV pack', (H+G)*c, t_pv['packed_bytes'],
+                      deps=[sm, dv], alloc=[(f'{tag}PVdig', t_pv['packed_bytes'])],
+                      free=[f'P8@{b}', f'V8T@{b}', f'V_scale@{b}'])
+        pv = q.arrays(f'{tag} PV', t_pv, pk, f'{tag}PVraw', f'{tag}PVdig')
 
         # U <- alpha*U + C; l <- l_new; m <- m_new.
-        update = vector(f'{tag} accumulate U,l,m', t_pv['raw_bytes']+4*H*G+12*G,
-                        4*H*G+8*G, deps=[pv, update, sm],
-                        free=[f'{tag}PVraw', f'stats@{b}'])
+        update = q.vector(f'{tag} accumulate U,l,m', t_pv['raw_bytes']+4*H*G+12*G,
+                          4*H*G+8*G, deps=[pv, update, sm],
+                          free=[f'{tag}PVraw', f'stats@{b}'])
 
-    norm = vector('normalize + encode O16', 4*H*G+4*G, 2*G*H, deps=[update],
-                  alloc=[('O16', 2*G*H)],
-                  free=['U', 'l', 'm', 'Q8', 'Q_scale'])
-    dma('store O16', 2*G*H, 'write', deps=[norm], free=['O16'])
+    norm = q.vector('normalize + encode O16', 4*H*G+4*G, 2*G*H, deps=[update],
+                    alloc=[('O16', 2*G*H)],
+                    free=['U', 'l', 'm', 'Q8', 'Q_scale'])
+    q.dma('store O16', 2*G*H, 'write', deps=[norm], free=['O16'])
     cycles = max(t['end'] for t in tasks)
 
-    # ---- replay SRAM occupancy in time order (frees, allocs, probes) ----
-    sram = SRAM(hw=hw)
-    order = []
-    for t in tasks:
-        order += [(t['start'], 1, t['id'], name, nb) for name, nb in t['alloc']]
-        order += [(t['end'], 0, t['id'], name, 0) for name in t['free']]
-        order.append((t['start'], 2, t['id'], None, 0))
-    for _, kind, tid, name, nb in sorted(order, key=lambda e: e[:3]):
-        if kind == 1:
-            sram.allocate(name, nb, 8)
-        elif kind == 0:
-            sram.free(name)
-        else:
-            tasks[tid]['used_bytes'] = sram.used_bytes
-    peak = sram.peak_bytes
-    for name in list(sram.buffers):
-        sram.free(name)
-
-    # ---- bookkeeping ------------------------------------------------------
-    counts = dict(key_blocks=len(packs), DMA=0, VCPU=0, SA1_jobs=0, SA2_jobs=0)
-    breakdown, events, steps = {}, [], []
-    for t in sorted(tasks, key=lambda t: (t['start'], t['id'])):
-        step = dict(name=t['name'], unit=t['unit'], start=t['start'],
-                    end=t['end'], cycles=t['cycles'], used_bytes=t['used_bytes'])
-        breakdown[t['unit']] = breakdown.get(t['unit'], 0) + t['cycles']
-        if t['unit'] != 'ARRAYS':
-            counts[t['unit']] += 1
-            events.append(step.copy())
-        else:
-            step['unit'] = 'SA1+SA2'
-            for a in range(2):
-                counts[f'SA{a+1}_jobs'] += t['info']['jobs'][a]
-                if t['info']['jobs'][a]:
-                    events.append(dict(name=t['name'], unit=f'SA{a+1}',
-                                       start=t['start']+t['info']['start'][a],
-                                       end=t['start']+t['info']['end'][a]))
-        steps.append(step)
-        if verbose:
-            print(f'{t["name"]:38s} {step["unit"]:7s} @{t["start"]:>9,d} '
-                  f'{t["cycles"]:8,d} cycles  SRAM {t["used_bytes"]/1024:8.2f} KiB')
-    breakdown['SA1+SA2'] = breakdown.pop('ARRAYS', 0)
+    sram, peak = _replay_sram(tasks, hw)
+    counts = dict(key_blocks=len(packs), DMA=0, VCPU=0,
+                  SA1_jobs=0, SA2_jobs=0, skipped_jobs=0)
+    breakdown, events, steps = _summarize(tasks, counts, hw, verbose)
     macs = 2 * G * H * S                        # scores + output, one token
     result = dict(cycles=cycles, time_us=hw.time_us(cycles),
                   time_ms=hw.time_us(cycles)/1000, counts=counts,
-                  breakdown=breakdown, macs=macs,
-                  mac_per_cycle=macs/cycles,
+                  breakdown=breakdown, macs=macs, mac_per_cycle=macs/cycles,
                   dram_bytes=2*S*H + 2*G*H + 2*G*H,   # INT8 cache + Q16 + O16
                   utilization={u: b/cycles for u, b in breakdown.items()},
                   steps=steps, events=events, sram=sram, peak_sram_bytes=peak,
@@ -597,19 +471,15 @@ def flash_decode(S=2048, H=128, G=4, Bc=256, R=256, hw=Hardware(),
         f'S={S}, H={H}, G={G}, Bc={Bc}, R={R} | {result["time_us"]:.2f} us | '
         f'{result["mac_per_cycle"]:.1f} MAC/cycle | peak SRAM '
         f'{result["max_sram_utilization_percent"]:.2f}%')
-    if verbose:
-        print(f'\nTotal: {result["time_us"]:.3f} us ({cycles:,} cycles), '
-              f'{result["mac_per_cycle"]:.1f} MAC/cycle')
-        print('Busy: ' + ', '.join(f'{u} {100*b/cycles:.1f}%'
-                                   for u, b in breakdown.items()))
-        print(f'Peak SRAM: {peak:,} bytes '
-              f'({result["max_sram_utilization_percent"]:.3f}%)')
+    _report(result, verbose)
     if gantt_path is not None:
         plot_flash_attention(result, gantt_path)
     return result
 
+
 def flash_attention_vanilla(T=2048, S=2048, H=128, G=4, Br=128, Bc=256, R=128,
                             causal=True, hw=Hardware(), verbose=False):
+    """Fully serial FA2 baseline: one command at a time, nothing overlapped."""
     sram, cycles, busy = SRAM(hw=hw), 0, {'DMA': 0, 'VCPU': 0, 'SA': 0}
     digits, pairs = hw.digits, hw.digits**2
 
@@ -702,3 +572,88 @@ def flash_attention_vanilla(T=2048, S=2048, H=128, G=4, Br=128, Bc=256, R=128,
         print(f'\nTotal {result["time_ms"]:.3f} ms; busy {busy}; '
               f'peak SRAM {result["sram_utilization_percent"]:.2f}%')
     return result
+
+
+def plot_flash_attention(result, path):
+    """Save a Gantt PNG; matplotlib is only needed when plotting.
+
+    Array bars are stream envelopes including command gaps and draining,
+    not claims of continuous arithmetic. Zoom shows cold setup + first Q tile
+    (or result['zoom_end']); result['title'] / ['panel_titles'] override text.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    import re
+
+    hw, cfg = result['hw'], result['config']
+    colors = {'DMA':'#4979b6', 'VCPU':'#dd9338', 'SA1':'#329b80', 'SA2':'#8965ba'}
+    lanes = list(colors)
+    zoom_end = result.get('zoom_end', result['first_tile_end'])
+    zoom_events = sorted((e for e in result['events'] if e['start'] < zoom_end),
+                         key=lambda e: (e['start'], lanes.index(e['unit'])))
+    ncol, per_col = 3, -(-len(zoom_events) // 3)
+    fig, axes = plt.subplots(3, 1, figsize=(15, 11 + 0.16*per_col),
+                             height_ratios=[2, 3, 0.18*per_col + 0.4],
+                             layout='constrained')
+    panel_titles = result.get('panel_titles',
+                              ['Complete KV-head group', 'Cold setup + first query tile'])
+    for ax, end, title, zoom in zip(axes[:2], [result['cycles'], zoom_end],
+                                    panel_titles, [False, True]):
+        shown = [e for e in result['events'] if e['start'] < end]
+        if not zoom:  # one bar collection per lane: fast for long schedules
+            for unit in lanes:
+                ranges = [(hw.time_us(e['start']),
+                           hw.time_us(min(e['end'], end)-e['start']))
+                          for e in shown if e['unit'] == unit]
+                ax.broken_barh(ranges, (lanes.index(unit)-0.35, 0.7),
+                               facecolors=colors[unit], edgecolors='white',
+                               linewidth=0.35)
+            shown = []
+        for e in shown:
+            x = hw.time_us(e['start'])
+            width = hw.time_us(min(e['end'], end)-e['start'])
+            y = lanes.index(e['unit'])
+            ax.broken_barh([(x, width)], (y-0.35, 0.7), facecolors=colors[e['unit']],
+                           edgecolors='white', linewidth=0.35)
+            # Zoom panel: wide blocks carry task + cycles; every block carries
+            # its index into the table below.
+            k = zoom_events.index(e) + 1
+            cyc = e['end']-e['start']
+            if width > hw.time_us(end)*0.08:
+                label = re.sub(r'^h\d+ ', '', e['name'])
+                ax.text(x+width/2, y, f'[{k}] {label}\n{cyc:,} cyc', ha='center',
+                        va='center', fontsize=7.5, color='white')
+            elif width > hw.time_us(end)*0.012:
+                ax.text(x+width/2, y, str(k), ha='center', va='center',
+                        fontsize=6.5, color='white')
+            else:
+                ax.text(x+width/2, y-0.37, str(k), ha='center', va='bottom',
+                        fontsize=6, color=colors[e['unit']])
+        ax.set_yticks(range(4), lanes)
+        ax.invert_yaxis()
+        ax.set_xlim(0, hw.time_us(end))
+        ax.set_xlabel('Time (microseconds)')
+        ax.set_title(title, loc='left')
+        ax.grid(axis='x', alpha=0.2)
+    tab = axes[2]
+    tab.axis('off')
+    for k, e in enumerate(zoom_events):
+        col, row = divmod(k, per_col)
+        tab.text(col/ncol, 1 - row/per_col,
+                 f'[{k+1:>2}] {e["unit"]:4s} @{hw.time_us(e["start"]):7.2f} us  '
+                 f'{e["end"]-e["start"]:7,d} cyc  {e["name"]}',
+                 transform=tab.transAxes, fontsize=7, family='monospace',
+                 va='top', color=colors[e['unit']])
+    mode = 'overlapped engines' if cfg['overlap'] else 'serial'
+    title = result.get('title') or (
+        f'FlashAttention | {hw.array_model} | {hw.control} control | {mode}\n'
+        f'T={cfg["T"]}, S={cfg["S"]}, H={cfg["H"]}, G={cfg["G"]}, '
+        f'Br={cfg["Br"]}, Bc={cfg["Bc"]}, R={cfg["R"]}, '
+        f'SA1 rows QK/PV={cfg["split_qk"]}/{cfg["split_pv"]} | '
+        f'{result["time_ms"]:.3f} ms | peak SRAM '
+        f'{result["max_sram_utilization_percent"]:.2f}%')
+    fig.suptitle(title, fontsize=13)
+    fig.legend(handles=[Patch(color=c, label=u) for u,c in colors.items()],
+               loc='outside lower center', ncol=4)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)

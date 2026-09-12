@@ -276,8 +276,8 @@ class DMA:
                    else self.hw.dram_write_latency)
         return self.hw.dma_setup + latency + divup(self.nbytes, self.hw.dma_bw)
 
-    def transfer(self, data, dtype: str | int, direction: str | None = None,
-                 sram: SRAM | None = None, name: str | None = None,
+    def transfer(self, data, dtype: str | int, direction = None,
+                 sram= None, name = None,
                  release: bool = False) -> int:
         """Cycles = setup + DRAM first-byte latency + ceil(bytes/dma_bw).
         """

@@ -71,29 +71,6 @@ def kernel_time(x_bytes, unit="both", K1=256, K2=None):
             "latency":   LAT + launch + load + compute + store,   # serial, one shot
             "pipelined": LAT + launch + max(load, compute, store)}  # double-buffered
 
-byte_list = [16 * MB]
-device_list = ["sa16", "sa32", "both"]
-K1_list = [32, 64, 128, 256]
-K2_list = [32, 64, 128, 256]
-
-print(f"{'size':>8} {'device':>7} {'K1/K2':>9} {'transfer':>12} {'compute':>12} "
-      f"{'total':>13} {'transfer%':>10}")
-print("-" * 78)
-
-for x in byte_list:
-    for unit in device_list:
-        # both arrays -> sweep a depth for each; a single array has only K1
-        pairs = ([(k1, k2) for k1 in K1_list for k2 in K2_list] if unit == "both"
-                 else [(k1, None) for k1 in K1_list])
-        for K1, K2 in pairs:
-            r = kernel_time(x, unit, K1, K2)
-            transfer = r["load"] + r["store"]      # DRAM->SRAM  +  SRAM->DRAM
-            compute = r["compute"]
-            total = r["latency"]                   # transfer + compute + LAT
-            label = f"{K1}/{K2}" if K2 is not None else f"{K1}"
-            print(f"{x // MB:>6}MB {unit:>7} {label:>9} {transfer:>12,.0f} {compute:>12,.0f} "
-                  f"{total:>13,.0f} {100 * transfer / total:>9.2f}%")
-        print("-" * 78)
 
 def count_fa2(B=B, L=L, T=T, S=S, D=D, N=N, K=K, H=H,
               Br=Br, Bc=Bc, sa1_rows=None, sa2_rows=None, causal=True):

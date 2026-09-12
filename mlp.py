@@ -1,8 +1,57 @@
-from fa import _array_matmul, _balanced_split, plot_flash_attention
+from fa import _Queue, _array_matmul, _balanced_split, plot_flash_attention
 from tile_model import Hardware, VCPU, DMA, SRAM
 
 DOWN_LAG = 1  # Arrays queue gate+up(f+1) before down(f): Z(f) is hidden.
 ACC_LAG = 1   # Y accumulation of f is queued after the gate+up work of f+2.
+
+
+def _replay(tasks, hw):
+    """Replay the timed allocs/frees/probes; record used_bytes, return peak."""
+    sram = SRAM(hw=hw)
+    order = []
+    for t in tasks:
+        order += [(t['start'], 1, t['id'], name, nb) for name, nb in t['alloc']]
+        order += [(t['end'], 0, t['id'], name, 0) for name in t['free']]
+        order.append((t['start'], 2, t['id'], None, 0))
+    for _, kind, tid, name, nb in sorted(order, key=lambda e: e[:3]):
+        if kind == 1:
+            sram.allocate(name, nb, 8)
+        elif kind == 0:
+            sram.free(name)
+        else:
+            tasks[tid]['used_bytes'] = sram.used_bytes
+    peak = sram.peak_bytes
+    for name in list(sram.buffers):
+        sram.free(name)
+    return sram, peak
+
+
+def _collect(tasks, counts, hw, verbose):
+    """Busy cycles per queue, job counts, Gantt events and the step table."""
+    breakdown, events, steps = {}, [], []
+    for t in sorted(tasks, key=lambda t: (t['start'], t['id'])):
+        step = dict(name=t['name'], unit=t['unit'], start=t['start'], end=t['end'],
+                    cycles=t['cycles'], used_bytes=t['used_bytes'])
+        if t['unit'] != 'ARRAYS':
+            counts[t['unit']] += 1
+            breakdown[t['unit']] = breakdown.get(t['unit'], 0) + t['cycles']
+            events.append(step.copy())
+        else:
+            timing = t['info']
+            step['unit'] = 'SA1+SA2'
+            breakdown['SA1+SA2'] = breakdown.get('SA1+SA2', 0) + t['cycles']
+            for a in range(2):
+                counts[f'SA{a+1}_jobs'] += timing['jobs'][a]
+                if timing['jobs'][a]:
+                    events.append(dict(name=t['name'], unit=f'SA{a+1}',
+                                       start=t['start']+timing['start'][a],
+                                       end=t['start']+timing['end'][a]))
+        steps.append(step)
+        if verbose:
+            print(f'{t["name"]:42s} {t["unit"]:6s} @{t["start"]:>13,d} '
+                  f'{t["cycles"]:9,d} cycles {hw.time_us(t["cycles"]):10.3f} us  '
+                  f'SRAM {t["used_bytes"]/1024:9.2f} KiB')
+    return breakdown, events, steps
 
 
 def mlp(M=2048, D=4096, F=14336, Mt=192, Ft=256, Mt_sa1=None, R=256,
@@ -208,49 +257,10 @@ def mlp(M=2048, D=4096, F=14336, Mt=192, Ft=256, Mt_sa1=None, R=256,
         emit_accumulate(p)
     cycles = max(t['end'] for t in tasks)
 
-    # Replay SRAM occupancy in time order (frees, allocs, probes).
-    sram = SRAM(hw=hw)
-    order = []
-    for t in tasks:
-        order += [(t['start'], 1, t['id'], name, nb) for name, nb in t['alloc']]
-        order += [(t['end'], 0, t['id'], name, 0) for name in t['free']]
-        order.append((t['start'], 2, t['id'], None, 0))
-    for _, kind, tid, name, nb in sorted(order, key=lambda e: e[:3]):
-        if kind == 1:
-            sram.allocate(name, nb, 8)
-        elif kind == 0:
-            sram.free(name)
-        else:
-            tasks[tid]['used_bytes'] = sram.used_bytes
-    peak = sram.peak_bytes
-    for name in list(sram.buffers):
-        sram.free(name)
-
+    sram, peak = _replay(tasks, hw)
     counts = dict(token_tiles=len(tiles), feature_tiles=nF, DMA=0, VCPU=0,
                   SA1_jobs=0, SA2_jobs=0)
-    breakdown, events, steps = {}, [], []
-    for t in sorted(tasks, key=lambda t: (t['start'], t['id'])):
-        step = dict(name=t['name'], unit=t['unit'], start=t['start'], end=t['end'],
-                    cycles=t['cycles'], used_bytes=t['used_bytes'])
-        if t['unit'] != 'ARRAYS':
-            counts[t['unit']] += 1
-            breakdown[t['unit']] = breakdown.get(t['unit'], 0) + t['cycles']
-            events.append(step.copy())
-        else:
-            timing = t['info']
-            step['unit'] = 'SA1+SA2'
-            breakdown['SA1+SA2'] = breakdown.get('SA1+SA2', 0) + t['cycles']
-            for a in range(2):
-                counts[f'SA{a+1}_jobs'] += timing['jobs'][a]
-                if timing['jobs'][a]:
-                    events.append(dict(name=t['name'], unit=f'SA{a+1}',
-                                       start=t['start']+timing['start'][a],
-                                       end=t['start']+timing['end'][a]))
-        steps.append(step)
-        if verbose:
-            print(f'{t["name"]:42s} {t["unit"]:6s} @{t["start"]:>13,d} '
-                  f'{t["cycles"]:9,d} cycles {hw.time_us(t["cycles"]):10.3f} us  '
-                  f'SRAM {t["used_bytes"]/1024:9.2f} KiB')
+    breakdown, events, steps = _collect(tasks, counts, hw, verbose)
     macs = 3*M*D*F
     weight_bytes = hw.digits*3*D*F*len(tiles)
     first_tile_end = next(t['end'] for t in tasks if t['name'].endswith('store Y16'))
@@ -284,6 +294,217 @@ def mlp(M=2048, D=4096, F=14336, Mt=192, Ft=256, Mt_sa1=None, R=256,
                                     for u, b in breakdown.items()))
         print(f'Weights streamed: {weight_bytes/2**20:,.0f} MiB '
               f'({len(tiles)} token tiles)')
+        print(f'Peak SRAM: {peak:,} bytes ({100*peak/sram.capacity_bytes:.3f}%)')
+    if gantt_path is not None:
+        plot_flash_attention(result, gantt_path)
+    return result
+
+
+def mlp_decode(M=16, D=4096, F=14336, Ft=256, Nt_sa1=None, R=256,
+               residual=True, hw=Hardware(), overlap=True, verbose=True,
+               gantt_path=None):
+    """Time ONE SwiGLU MLP layer for ONE decode step of M concurrent tokens.
+
+        G|U^T = [Wg|Wu]^T X^T  (2F x D by D x M),  Z = SiLU(G) * U,
+        Y^T = Wd^T Z^T (+ X^T).
+    M is the decode batch (one token per sequence), so a step of B sequences
+    is one call with M=B, not B calls; multiply by L for the whole model.
+
+    Why not mlp(). mlp() puts tokens on the array rows and features on the
+    16-wide output axis, which is right for prefill and wasteful here: a job
+    pass covers 48 rows (SA1 16 + SA2 32), so M=1 fills one of them and
+    M=1..48 all cost the same 15.4 ms/layer at 11 of 552 MAC/cycle. This
+    kernel transposes the mapping - output features on the array rows (2Ft
+    of them for gate+up, D for down) and the M tokens on the 16-wide axis -
+    so every job is full for M >= 16 and any M <= 16 costs the same. The
+    weights are therefore pre-packed TRANSPOSED in DRAM ([2F, D] and [D, F]
+    in operand layout); the bytes moved are identical.
+
+    Regime. Each step re-streams all 3 D F weight bytes (168 MiB per layer;
+    one matrix is 56 MiB against 16 MiB of SRAM, so nothing stays resident)
+    for only 3 M D F MACs. Arithmetic intensity is M MAC per weight byte
+    against a ridge of 552/64 = 8.6, so up to M ~ 9 the layer is DRAM bound
+    at 2.75 ms/layer and extra sequences are free; past that it is the
+    arrays again. Decode is a bandwidth problem, prefill a compute one.
+
+    Tiling and pipeline mirror mlp(): hidden features in tiles of Ft (the
+    arrays produce 2Ft rows of G|U over D/R reduction chunks, then all D
+    rows of Y over that Ft chunk), weight tiles double-buffered and
+    prefetched two tiles ahead, gate+up(f+1) queued before down(f) so Z(f)
+    is hidden, Y accumulation lagged one tile. Chunk partials are reduced in
+    FP32 on the vector CPU, so SRAM stays independent of D. Nt_sa1 = None
+    balances the SA1/SA2 row split per GEMM; Ft=512 packs the 2Ft rows into
+    the arrays slightly better (5.34 ms, 528 MAC/cycle) but takes 80% of
+    SRAM against 41% here. Timing and metadata only.
+    """
+    for value in (M, D, F, Ft, R):
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError('Dimensions and R must be positive integers')
+    if R > hw.max_reduction:
+        raise ValueError(f'R must be <= {hw.max_reduction} for {hw.arithmetic}')
+    if Nt_sa1 is not None and (not isinstance(Nt_sa1, int) or Nt_sa1 < 0):
+        raise ValueError('Nt_sa1 must be None (auto) or a row count >= 0')
+
+    def split(m, n, depth):
+        if Nt_sa1 is None:
+            return _balanced_split(m, n, depth, R, hw)
+        return min(Nt_sa1, m)
+
+    ftiles = [(j, min(Ft, F-j)) for j in range(0, F, Ft)]
+    nF = len(ftiles)
+
+    q = _Queue(hw, overlap)
+    tasks = q.tasks
+
+    def arrays(name, timing, **kw):
+        return q.task(name, 'ARRAYS', max(timing['end']), info=timing, **kw)
+
+    # X16 [M, D] arrives once and is quantized into the transposed operand
+    # layout X8^T [D, M]; both are a few hundred KiB at decode batch sizes.
+    dX = q.dma('load X16', 2*M*D, 'read', alloc=[('X16', 2*M*D)])
+    x8 = q.vector('quantize X -> X8^T operands', 2*M*D, M*D, deps=[dX],
+                  alloc=[('X8', M*D)], free=['X16'])
+
+    w_gu, w_d, gateup_done, down_done, z_ready, down_raw = {}, {}, {}, {}, {}, {}
+    acc_done = [None]
+
+    def load_gu(f):
+        if f >= nF or f in w_gu:
+            return
+        j, n = ftiles[f]
+        w_gu[f] = q.dma(f'f{j} load Wg|Wu^T', hw.digits*2*n*D, 'read',
+                        deps=[gateup_done.get(f-2)],
+                        alloc=[(f'Wgu@{f}', hw.digits*2*n*D), (f'sW@{f}', 8*n+4*D)])
+
+    def load_d(f):
+        if f >= nF or f in w_d:
+            return
+        j, n = ftiles[f]
+        w_d[f] = q.dma(f'f{j} load Wd^T', hw.digits*D*n, 'read',
+                       deps=[down_done.get(f-2)],
+                       alloc=[(f'Wd@{f}', hw.digits*D*n)])
+
+    def emit_gateup(f):
+        """2Ft rows of G|U for the M tokens, chunked over the D reduction."""
+        j, n = ftiles[f]
+        load_gu(f)
+        chunks = list(range(0, D, R))
+        acc = None
+        for ci, k in enumerate(chunks):
+            kc, last = min(R, D-k), ci == len(chunks)-1
+            timing = _array_matmul(2*n, M, kc, split(2*n, M, kc), R, hw)
+            a = arrays(f'f{j} gate+up k{k}', timing, deps=[x8, w_gu[f]],
+                       alloc=[(f'GUraw@{f}k{k}', timing['raw_bytes'])],
+                       free=[f'Wgu@{f}'] if last else [])
+            if last:
+                # Final pass: add last partials, apply scales, SiLU(G)*U,
+                # static-scale quantize, write Z8^T in operand layout.
+                gu = 0 if ci == 0 else 4*2*n*M
+                acc = q.vector(f'f{j} G,U -> SiLU(G)*U -> Z8^T',
+                               timing['raw_bytes']+gu+8*n, n*M, deps=[a, acc],
+                               alloc=[(f'Z8@{f}', n*M)],
+                               free=[f'GUraw@{f}k{k}'] + ([] if ci == 0 else [f'GU32@{f}']))
+            else:
+                acc = q.vector(f'f{j} G,U32 {"=" if ci == 0 else "+="} k{k}',
+                               timing['raw_bytes']+(0 if ci == 0 else 4*2*n*M),
+                               4*2*n*M, deps=[a, acc],
+                               alloc=[(f'GU32@{f}', 4*2*n*M)] if ci == 0 else [],
+                               free=[f'GUraw@{f}k{k}'])
+        gateup_done[f], z_ready[f] = a, acc
+
+    def emit_down(f):
+        """All D rows of Y for the M tokens, reduction = this Ft tile."""
+        j, n = ftiles[f]
+        load_d(f)
+        for k in range(0, n, R):
+            kc, last = min(R, n-k), k+R >= n
+            timing = _array_matmul(D, M, kc, split(D, M, kc), R, hw)
+            down_raw[(f, k)] = timing['raw_bytes']
+            down_done[f] = arrays(f'f{j} down k{k}', timing,
+                                  deps=[z_ready[f], w_d[f]],
+                                  alloc=[(f'Yraw@{f}k{k}', timing['raw_bytes'])],
+                                  free=[f'Z8@{f}', f'Wd@{f}'] if last else [])
+
+    def emit_accumulate(f):
+        j, n = ftiles[f]
+        for ci, k in enumerate(range(0, n, R)):
+            new = f == 0 and ci == 0
+            last = k+R >= n
+            raw = down_raw[(f, k)]
+            acc_done[0] = q.vector(
+                f'f{j} Y32 {"=" if new else "+="} k{k}',
+                raw+(0 if new else 4*D*M)+(4*D if last else 0), 4*D*M,
+                deps=[down_done[f], acc_done[0]],
+                alloc=[('Y32', 4*D*M)] if new else [],
+                free=[f'Yraw@{f}k{k}', f'sW@{f}'] if last else [f'Yraw@{f}k{k}'])
+        if f == nF-1:
+            deps = [acc_done[0]]
+            if residual:
+                deps.append(q.dma('load residual X16', 2*M*D, 'read',
+                                  alloc=[('Xres', 2*M*D)]))
+            enc = q.vector(f'encode Y16{" + residual" if residual else ""}',
+                           4*D*M+4+(2*M*D if residual else 0), 2*M*D, deps=deps,
+                           alloc=[('Y16', 2*M*D)],
+                           free=['Y32', 'X8'] + (['Xres'] if residual else []))
+            q.dma('store Y16', 2*M*D, 'write', deps=[enc], free=['Y16'])
+
+    lead, lag = (DOWN_LAG, ACC_LAG) if overlap else (0, 0)
+    zoom_end = None
+    for f in range(nF):
+        if f == 0:
+            for g in range(min(lead, nF)):
+                emit_gateup(g)
+        if f+lead < nF:
+            emit_gateup(f+lead)
+        if overlap:
+            load_d(f+lead)  # prefetch into the slot freed by down(f-2+lead)
+        emit_down(f)
+        if f-lag >= 0:
+            emit_accumulate(f-lag)
+            zoom_end = tasks[-1]['end'] if zoom_end is None else zoom_end
+    for f in range(max(0, nF-lag), nF):
+        emit_accumulate(f)
+    cycles = max(t['end'] for t in tasks)
+
+    sram, peak = _replay(tasks, hw)
+    counts = dict(token_tiles=1, feature_tiles=nF, DMA=0, VCPU=0,
+                  SA1_jobs=0, SA2_jobs=0)
+    breakdown, events, steps = _collect(tasks, counts, hw, verbose)
+    macs = 3*M*D*F
+    weight_bytes = hw.digits*3*D*F
+    n0 = ftiles[0][1]
+    result = dict(cycles=cycles, time_us=hw.time_us(cycles),
+                  time_ms=hw.time_us(cycles)/1000, counts=counts, breakdown=breakdown,
+                  utilization={u: b/cycles for u, b in breakdown.items()},
+                  macs=macs, mac_per_cycle=macs/cycles,
+                  weight_dram_bytes=weight_bytes,
+                  dma_bound_cycles=weight_bytes//hw.dma_bw,
+                  us_per_token=hw.time_us(cycles)/M, steps=steps, events=events,
+                  sram=sram, peak_sram_bytes=peak,
+                  max_sram_utilization_percent=100*peak/sram.capacity_bytes,
+                  first_tile_end=cycles, zoom_end=zoom_end, hw=hw,
+                  panel_titles=['Complete MLP decode step',
+                                'Cold setup + first down projection'],
+                  config=dict(M=M, D=D, F=F, Mt=M, Ft=Ft, Mt_sa1=Nt_sa1, R=R,
+                              residual=residual, overlap=overlap,
+                              split_gateup=split(2*n0, M, min(R, D)),
+                              split_down=split(D, M, min(R, n0))))
+    cfg = result['config']
+    result['title'] = (
+        f'SwiGLU MLP decode step | {hw.array_model} | {hw.control} control | '
+        f'{"overlapped engines" if overlap else "serial"}\n'
+        f'M={M}, D={D}, F={F}, Ft={Ft}, R={R}, SA1 rows gate+up/down='
+        f'{cfg["split_gateup"]}/{cfg["split_down"]} | {result["time_ms"]:.3f} ms | '
+        f'{macs/cycles:,.0f} MAC/cycle | peak SRAM '
+        f'{result["max_sram_utilization_percent"]:.2f}%')
+    if verbose:
+        print(f'\nTotal: {result["time_ms"]:.6f} ms ({cycles:,} cycles), '
+              f'{macs/cycles:,.0f} MAC/cycle, '
+              f'{result["us_per_token"]:.1f} us/token/layer')
+        print('Busy: ' + ', '.join(f'{u} {100*b/cycles:.1f}%'
+                                    for u, b in breakdown.items()))
+        print(f'Weights streamed: {weight_bytes/2**20:,.0f} MiB per step '
+              f'-> DMA floor {hw.time_us(result["dma_bound_cycles"])/1000:.3f} ms')
         print(f'Peak SRAM: {peak:,} bytes ({100*peak/sram.capacity_bytes:.3f}%)')
     if gantt_path is not None:
         plot_flash_attention(result, gantt_path)
