@@ -1,0 +1,13 @@
+# Python >= 3.10 (code uses `X | None` and built-in generic type hints)
+
+# Numerics and plotting (code/*.py, C*/ and G*/ scripts)
+numpy>=1.24
+matplotlib>=3.7
+
+# Image display in notebooks (code/helper.py: plot)
+pillow>=10.0
+ipython>=8.10
+
+# Running the .ipynb notebooks
+ipykernel>=6.20
+notebook>=7.0
