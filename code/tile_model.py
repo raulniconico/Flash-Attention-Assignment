@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import prod
+from math import ceil, inf, prod
 from operator import index
 
 
@@ -298,6 +298,134 @@ class DMA:
                 if release:
                     sram.free(name)
         return cycles
+
+
+class Accelerator:
+    """One tile on the host: its own SA1, SA2, SRAM and vector CPU.
+
+    Commands arrive from the single Host, which also owns DRAM and the DMA;
+    data reaches other accelerators over Links (self.links, keyed by peer).
+    """
+    def __init__(self, hw: Hardware = Hardware(), name: str = 'acc0'):
+        self.hw, self.name = hw, name
+        self.sa1 = SA1(compute_model=hw.array_model)
+        self.sa2 = SA2(compute_model=hw.array_model)
+        self.sram = SRAM(hw=hw)
+        self.vcpu = VCPU(hw=hw)
+        self.links: dict[str, Link] = {}
+
+    @property
+    def arrays(self) -> tuple[SA1, SA2]:
+        return self.sa1, self.sa2
+
+    def link(self, peer: Accelerator) -> Link:
+        return self.links[peer.name]
+
+    def __repr__(self) -> str:
+        return f'Accelerator({self.name!r}, peers={sorted(self.links)})'
+
+
+class Link:
+    """Bidirectional SRAM-to-SRAM link between two accelerators.
+
+    Cycles = latency + ceil(bytes / bw). The default bw=inf makes a transfer
+    cost only the latency (0 by default). Like DMA/VCPU, a link runs one
+    transfer at a time; overlapping transfers are the scheduler's concern.
+    """
+    def __init__(self, a: Accelerator, b: Accelerator, bw: float = inf,
+                 latency: int = 0):
+        if a is b:
+            raise ValueError('A link needs two different accelerators')
+        if not bw > 0 or not isinstance(latency, int) or latency < 0:
+            raise ValueError('Link bw must be positive and latency a nonnegative integer')
+        self.a, self.b, self.bw, self.latency = a, b, bw, latency
+
+    def peer(self, src: Accelerator) -> Accelerator:
+        if src is self.a:
+            return self.b
+        if src is self.b:
+            return self.a
+        raise ValueError(f'{src.name} is not an end of this link')
+
+    def cycle(self, nbytes: int) -> int:
+        return self.latency + (0 if self.bw == inf else ceil(nbytes / self.bw))
+
+    def transfer(self, data, dtype: str | int, src: Accelerator,
+                 name: str | None = None, release: bool = False) -> int:
+        """Copy from src's SRAM to the peer's SRAM.
+
+        With name, the source buffer must match shape/dtype; the same name is
+        allocated at the destination and release frees it at the source.
+        """
+        dst = self.peer(src)
+        shape, dtype = data_shape(data), dtype_name(dtype)
+        if release and name is None:
+            raise ValueError('release requires a tracked buffer name')
+        if name is not None:
+            buf = src.sram.buffers[name]
+            if buf['shape'] != shape or buf['dtype'] != dtype:
+                raise ValueError('Transfer shape/dtype must match the SRAM buffer')
+            dst.sram.allocate(name, shape, dtype)
+            if release:
+                src.sram.free(name)
+        return self.cycle(data_bytes(shape, dtype))
+
+
+class Host:
+    """One host CPU commanding n accelerators, with a link between every pair.
+
+    Every array command goes through this one host, so jobs on all
+    accelerators share a single command interface (as SA1 and SA2 of one
+    tile already do); each command still costs hw.array_latency. DRAM belongs
+    to the host: its one DMA moves data between DRAM and any accelerator's SRAM.
+    """
+    def __init__(self, n: int = 2, hw: Hardware = Hardware(),
+                 link_bw: float = inf, link_latency: int = 0):
+        if not isinstance(n, int) or n < 1:
+            raise ValueError('Need at least one accelerator')
+        self.hw = hw
+        self.dma = DMA(hw=hw)
+        self.accelerators = [Accelerator(hw, f'acc{i}') for i in range(n)]
+        self.links: dict[tuple[int, int], Link] = {}
+        for i, a in enumerate(self.accelerators):
+            for j in range(i+1, n):
+                b = self.accelerators[j]
+                link = Link(a, b, link_bw, link_latency)
+                self.links[(i, j)] = a.links[b.name] = b.links[a.name] = link
+
+    def __getitem__(self, i: int) -> Accelerator:
+        return self.accelerators[i]
+
+    def __len__(self) -> int:
+        return len(self.accelerators)
+
+    def link(self, i: int, j: int) -> Link:
+        return self.links[(min(i, j), max(i, j))]
+
+    def dram(self, i: int, data, dtype: str | int, direction: str = 'read',
+             name: str | None = None, release: bool = False) -> int:
+        """DMA between host DRAM and accelerator i's SRAM; same cycles as DMA.transfer."""
+        sram = self[i].sram if name is not None else None
+        return self.dma.transfer(data, dtype, direction, sram, name, release)
+
+    def transfer(self, i: int, j: int, data, dtype: str | int,
+                 name: str | None = None, release: bool = False) -> int:
+        """Move data from accelerator i to j over their link; return cycles."""
+        return self.link(i, j).transfer(data, dtype, self[i], name, release)
+
+    def command(self, i: int, array: str, rows: int, K: int,
+                dtype: str | int = 8, cols: int = 16,
+                output: str | None = None) -> int:
+        """Issue one array job ('sa1' or 'sa2') on accelerator i.
+
+        Same cycles as SystolicArray.compute; output reserves the INT16
+        result buffer in that accelerator's SRAM.
+        """
+        if array not in ('sa1', 'sa2'):
+            raise ValueError("array must be 'sa1' or 'sa2'")
+        acc = self[i]
+        sram = acc.sram if output is not None else None
+        return getattr(acc, array).compute(rows, K, dtype, cols, self.hw, sram, output)
 
 
 def sram_allocation(N: int, d: int, br: int, bc: int,
