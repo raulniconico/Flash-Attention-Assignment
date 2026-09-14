@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Create .venv and install requirements.txt for this project (Linux / macOS / Git Bash).
 #
-# Usage: ./install.sh              # create or update .venv
-#        ./install.sh --recreate   # delete .venv first
+# Usage: ./install.sh1              # create or update .venv
+#        ./install.sh1 --recreate   # delete .venv first
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

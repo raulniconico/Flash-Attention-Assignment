@@ -14,6 +14,6 @@ A great deal of the detailed code, testing, and reasoning cannot be shown here i
 **5 performance parallelization.ipynb**: Performance analysis using the performance model, together with a discussion of parallelization strategies
 
 
-For easier reading, PDF versions of the six notebooks can be found in the pdf folder. The environment required to run the notebooks can be installed via install.sh.
+For easier reading, PDF versions of the six notebooks can be found in the pdf folder. The environment required to run the notebooks can be installed via install.sh1.
 
 Finally, all the code used in the notebooks is located in the code folder.

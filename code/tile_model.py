@@ -252,8 +252,12 @@ class VCPU:
         writes = data_bytes(data, out_dtype) * write_passes
         return VCPU(reads, writes, self.hw).launch_cycle()
 
-    def transform(self, sram: SRAM, source: str, output: str,
-                  out_dtype, read_passes: int = 1,
+    def transform(self,
+                  sram: SRAM,
+                  source: str,
+                  output: str,
+                  out_dtype,
+                  read_passes: int = 1,
                   free_input: bool = False) -> int:
 
 

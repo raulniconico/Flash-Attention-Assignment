@@ -78,9 +78,14 @@ class _Queue:
     has finished. overlap=False also chains each command to the previous one,
     i.e. the fully serial schedule. Every task declares deps/alloc/free, so
     the schedule alone determines SRAM occupancy (see _replay_sram).
+
+    fuse=True merges a vector command into the previous vector command when
+    it frees an intermediate buffer that command allocated: one launch, and
+    the intermediate is neither written to SRAM nor read back (assumes the
+    vector CPU holds it in its registers).
     """
-    def __init__(self, hw, overlap=True):
-        self.hw, self.overlap = hw, overlap
+    def __init__(self, hw, overlap=True, fuse=False):
+        self.hw, self.overlap, self.fuse = hw, overlap, fuse
         self.tasks, self.free_at = [], {'DMA': 0, 'VCPU': 0, 'ARRAYS': 0}
 
     def task(self, name, unit, duration, deps=(), alloc=(), free=(), info=None):
@@ -95,8 +100,31 @@ class _Queue:
         self.tasks.append(rec)
         return rec['id']
 
-    def vector(self, name, reads, writes, **kw):
-        return self.task(name, 'VCPU', VCPU(reads, writes, self.hw).launch_cycle(), **kw)
+    def vector(self, name, reads, writes, deps=(), alloc=(), free=(), **kw):
+        head = self.tasks[-1] if self.fuse and self.tasks else None
+        mid = ({n: b for n, b in head['alloc'] if n in free}
+               if head is not None and head['unit'] == 'VCPU' else {})
+        if not mid:
+            tid = self.task(name, 'VCPU', VCPU(reads, writes, self.hw).launch_cycle(),
+                            deps=deps, alloc=alloc, free=free, **kw)
+            self.tasks[tid]['rw'] = (reads, writes)
+            return tid
+        # Fuse into head: drop the intermediate's write + read and one launch.
+        saved = sum(mid.values())
+        reads, writes = head['rw'][0] + reads - saved, head['rw'][1] + writes - saved
+        deps = [d for d in deps if d is not None and d != head['id']]
+        start = max([head['start']] + [self.tasks[d]['end'] for d in deps])
+        cycles = VCPU(reads, writes, self.hw).launch_cycle()
+        words, tag = name.split(), 0  # drop the block tag shared with head
+        while tag < len(words) - 1 and head['name'].split()[tag:tag+1] == [words[tag]]:
+            tag += 1
+        head.update(name=head['name'] + ' + ' + ' '.join(words[tag:]),
+                    start=start, end=start+cycles, cycles=cycles, rw=(reads, writes),
+                    deps=head['deps'] + deps,
+                    alloc=[a for a in head['alloc'] if a[0] not in mid] + list(alloc),
+                    free=head['free'] + [f for f in free if f not in mid])
+        self.free_at['VCPU'] = head['end']
+        return head['id']
 
     def dma(self, name, nbytes, direction, **kw):
         return self.task(name, 'DMA', DMA(nbytes, direction, self.hw).cycle(), **kw)
@@ -183,7 +211,7 @@ def _report(result, verbose):
 
 def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
                     Br_sa1=None, R=128, causal=True, q_offset=0,
-                    hw=Hardware(), overlap=True, skip_masked=True,
+                    hw=Hardware(), overlap=True, skip_masked=True, fuse=False,
                     verbose=True, gantt_path=None):
     """Time ONE KV-head group of prefill, in ONE layer and ONE batch element.
 
@@ -198,6 +226,8 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
     softmax hides under the score GEMMs and the in-order vector queue never
     stalls on PV(p). K is quantized before V, Q of the next tile is
     prefetched into a second buffer, and O16 stores overlap the next tile.
+    fuse=True fuses QK reconstruct + softmax + PV pack and PV reconstruct +
+    update into single vector commands (see _Queue).
 
     Work split. Br_sa1 rows of every GEMM go to SA1 and the rest to SA2;
     None picks, per geometry, the multiple of 16 minimizing the two-array
@@ -243,7 +273,7 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
     P = len(pairs)
     last_pair_of_tile = {pr['tile']: p for p, pr in enumerate(pairs)}
 
-    q = _Queue(hw, overlap)
+    q = _Queue(hw, overlap, fuse)
     tasks = q.tasks
 
     # K/V loaded once for all G query heads.
@@ -368,7 +398,7 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
                                       if t['name'].endswith('store O16')),
                   hw=hw,
                   config=dict(T=T,S=S,H=H,G=G,Br=Br,Bc=Bc,Br_sa1=Br_sa1,R=R,
-                              overlap=overlap, skip_masked=skip_masked,
+                              overlap=overlap, skip_masked=skip_masked, fuse=fuse,
                               split_qk=split(full['m'], full['c'], H, None, 'cols'),
                               split_pv=split(full['m'], H, full['c'], None, 'depth')))
     _report(result, verbose)
@@ -378,7 +408,7 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
 
 
 def flash_decode(S=2048, H=128, G=4, Bc=2048, R=256, hw=Hardware(),
-                 overlap=True, verbose=True, gantt_path=None):
+                 overlap=True, fuse=False, verbose=True, gantt_path=None):
     """Time ONE decode step of ONE KV-head group: G query heads, one token each.
 
     For the whole model, serial group count = B * L * K per generated token.
@@ -395,12 +425,14 @@ def flash_decode(S=2048, H=128, G=4, Bc=2048, R=256, hw=Hardware(),
        the bytes. Blocks stream with a two-block prefetch.
     3. Softmax. m, l and the FP32 accumulator U[H,G] are updated once per key
        block; the last update normalizes and stores O16.
+
+    fuse=True fuses softmax + PV pack into one vector command (see _Queue).
     """
     for value in (S, H, G, Bc, R):
         if not isinstance(value, int) or value <= 0:
             raise ValueError('S, H, G, Bc and R must be positive integers')
 
-    q = _Queue(hw, overlap)
+    q = _Queue(hw, overlap, fuse)
     tasks = q.tasks
 
     # Q of this step: G rows, transposed to (H,G) for the column operand.
@@ -464,7 +496,7 @@ def flash_decode(S=2048, H=128, G=4, Bc=2048, R=256, hw=Hardware(),
                   hw=hw, first_tile_end=next(t['end'] for t in tasks
                                              if t['name'].endswith('accumulate U,l,m')),
                   panel_titles=['Complete decode step', 'First key block'],
-                  config=dict(S=S, H=H, G=G, Bc=Bc, R=R, overlap=overlap))
+                  config=dict(S=S, H=H, G=G, Bc=Bc, R=R, overlap=overlap, fuse=fuse))
     result['title'] = (
         f'FlashAttention decode | {hw.array_model} | {hw.control} control | '
         f'{"overlapped engines" if overlap else "serial"}\n'
