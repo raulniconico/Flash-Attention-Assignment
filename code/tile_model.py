@@ -19,6 +19,7 @@ DTYPE_BYTES = {
 
 def dtype_name(dtype: str | int) -> str:
     """Integer dtype arguments are bit widths: 8 -> int8, 16 -> int16."""
+
     if isinstance(dtype, int):
         dtype = f'int{dtype}'
     dtype = str(dtype).lower()
@@ -29,8 +30,8 @@ def dtype_name(dtype: str | int) -> str:
     return dtype
 
 
-def data_shape(data) -> tuple[int, ...]:
-    """Accept shape tuples/lists, an element count, or an object with .shape."""
+def data_shape(data):
+    """Accept shape tuples/lists, """
     if hasattr(data, 'shape'):
         data = data.shape
     if isinstance(data, int):
@@ -44,7 +45,7 @@ def data_shape(data) -> tuple[int, ...]:
     return shape
 
 
-def data_bytes(data, dtype: str | int) -> int:
+def data_bytes(data, dtype) -> int:
     """Bytes = product(shape) x bytes per element; no tensor data is read."""
     return prod(data_shape(data)) * DTYPE_BYTES[dtype_name(dtype)]
 
@@ -80,9 +81,6 @@ class Hardware:
 
 class SRAM:
     """Track allocated buffers, not arithmetic or transfer time.
-
-    SRAM has different bandwidths to each engine; DMA/VCPU/SA charge those
-    transfers. Do not add another generic SRAM transfer time.
     """
     def __init__(self, capacity_bytes: int | None = None,
                  hw: Hardware = Hardware()):
@@ -105,7 +103,9 @@ class SRAM:
         """Fraction occupied, from 0 to 1."""
         return self.used_bytes / self.capacity_bytes
 
-    def allocate(self, name: str, data, dtype: str | int) -> int:
+    def allocate(self,
+                 name: str,
+                 data, dtype) -> int:
         """Reserve a new named buffer. Return allocated bytes, not cycles."""
         if name in self.buffers:
             raise ValueError(f'Buffer already exists: {name}')
@@ -118,10 +118,13 @@ class SRAM:
         self.history.append(dict(action='allocate', name=name, used_bytes=self.used_bytes))
         return nbytes
 
-    def free(self, name: str) -> None:
+    def free(self,
+             name: str) -> None:
+
         """Release one buffer. Missing names raise KeyError."""
         del self.buffers[name]
         self.history.append(dict(action='free', name=name, used_bytes=self.used_bytes))
+
 
     def status(self) -> dict:
         return dict(used_bytes=self.used_bytes, free_bytes=self.free_bytes,
@@ -139,7 +142,9 @@ class SystolicArray:
     BW_in: int
     BW_out = 8
 
-    def __init__(self, rows: int | None = None, K: int = 128, cols: int = 16,
+    def __init__(self, rows = None,
+                 K: int = 128,
+                 cols: int = 16,
                  compute_model: str = 'mac'):
         rows = self.physical_rows if rows is None else rows
         if not (1 <= rows <= self.physical_rows and 1 <= K <= 256
@@ -187,19 +192,15 @@ class SystolicArray:
     def mac_rate(self) -> float:
         return self.macs() / self.cycle()
 
-    def compute(self, rows: int, K: int, dtype: str | int = 8, cols: int = 16,
-                hw: Hardware = Hardware(), sram: SRAM | None = None,
-                output: str | None = None) -> int:
-        """Cycles = array_latency + max(input_cycles, compute_cycles) + output_cycles.
+    def compute(self,
+                rows: int,
+                K: int,
+                dtype = 8,
+                cols: int = 16,
+                hw: Hardware = Hardware(),
+                sram = None,
+                output = None) -> int:
 
-        Example: SA1().compute(16, 128, 8).
-        Only 8-bit integer input is modeled; the physical output is INT16.
-        Optional sram/output reserves a NEW full physical output buffer.
-        Caller must allocate padded input buffers separately. Neither input
-        conversion nor four digit-pair products are automatically included.
-        This estimates the requested job without changing the instance's
-        original cycle()/latency() parameters. compute_model comes from self.
-        """
         if dtype_name(dtype) not in ('int8', 'uint8'):
             raise ValueError('Array inputs must be 8-bit integers in this model')
         job = type(self)(rows, K, cols, self.compute_model)
@@ -221,7 +222,9 @@ class SA2(SystolicArray):
 
 
 class VCPU:
-    def __init__(self, in_bytes: int = 0, out_bytes: int = 0,
+    def __init__(self,
+                 in_bytes: int = 0,
+                 out_bytes: int = 0,
                  hw: Hardware = Hardware()):
         self.in_bytes, self.out_bytes, self.hw = in_bytes, out_bytes, hw
 
@@ -231,13 +234,16 @@ class VCPU:
     def launch_cycle(self) -> int:
         return self.hw.vector_launch + self.cycle()
 
-    def compute(self, data, in_dtype: str | int, out_dtype: str | int,
-                read_passes: int = 1, write_passes: int = 1) -> int:
-        """Same-shape operation: launch + ceil((reads + writes)/vector_bw).
+    def compute(self,
+                data,
+                in_dtype,
+                out_dtype,
+                read_passes: int = 1,
+                write_passes: int = 1) -> int:
+        """
+        Same-shape operation: launch + ceil((reads + writes)/vector_bw).
 
         Example: VCPU().compute((16,128), 16, 8, read_passes=2).
-        Count separate buffers for scales/intermediates when needed; this
-        method counts only the supplied input/output payload and passes.
         """
         if (not isinstance(read_passes, int) or not isinstance(write_passes, int)
                 or read_passes < 0 or write_passes < 0):
@@ -247,14 +253,10 @@ class VCPU:
         return VCPU(reads, writes, self.hw).launch_cycle()
 
     def transform(self, sram: SRAM, source: str, output: str,
-                  out_dtype: str | int, read_passes: int = 1,
+                  out_dtype, read_passes: int = 1,
                   free_input: bool = False) -> int:
-        """Model conversion/copy and track two simultaneously live buffers.
 
-        Destination must have a new name. Out-of-place conversion: allocate
-        output first, then optionally release input after the operation.
-        This is metadata bookkeeping, not numerical quantization.
-        """
+
         src = sram.buffers[source]
         cycles = self.compute(src['shape'], src['dtype'], out_dtype, read_passes)
         sram.allocate(output, src['shape'], out_dtype)
@@ -265,7 +267,9 @@ class VCPU:
 
 
 class DMA:
-    def __init__(self, nbytes: int = 0, direction: str = 'read',
+    def __init__(self,
+                 nbytes: int = 0,
+                 direction: str = 'read',
                  hw: Hardware = Hardware()):
         if direction not in ('read', 'write'):
             raise ValueError('DMA direction must be read or write')
@@ -301,12 +305,11 @@ class DMA:
 
 
 class Accelerator:
-    """One tile on the host: its own SA1, SA2, SRAM and vector CPU.
 
-    Commands arrive from the single Host, which also owns DRAM and the DMA;
-    data reaches other accelerators over Links (self.links, keyed by peer).
-    """
-    def __init__(self, hw: Hardware = Hardware(), name: str = 'acc0'):
+
+    def __init__(self,
+                 hw: Hardware = Hardware(),
+                 name: str = 'acc0'):
         self.hw, self.name = hw, name
         self.sa1 = SA1(compute_model=hw.array_model)
         self.sa2 = SA2(compute_model=hw.array_model)
@@ -326,13 +329,13 @@ class Accelerator:
 
 
 class Link:
-    """Bidirectional SRAM-to-SRAM link between two accelerators.
-
-    Cycles = latency + ceil(bytes / bw). The default bw=inf makes a transfer
-    cost only the latency (0 by default). Like DMA/VCPU, a link runs one
-    transfer at a time; overlapping transfers are the scheduler's concern.
     """
-    def __init__(self, a: Accelerator, b: Accelerator, bw: float = inf,
+    Cycles = latency + ceil(bytes / bw)
+    """
+    def __init__(self,
+                 a: Accelerator,
+                 b: Accelerator,
+                 bw = inf,
                  latency: int = 0):
         if a is b:
             raise ValueError('A link needs two different accelerators')
@@ -354,8 +357,7 @@ class Link:
                  name: str | None = None, release: bool = False) -> int:
         """Copy from src's SRAM to the peer's SRAM.
 
-        With name, the source buffer must match shape/dtype; the same name is
-        allocated at the destination and release frees it at the source.
+        With name, the source buffer must match shape/dtype
         """
         dst = self.peer(src)
         shape, dtype = data_shape(data), dtype_name(dtype)
@@ -372,15 +374,14 @@ class Link:
 
 
 class Host:
-    """One host CPU commanding n accelerators, with a link between every pair.
-
-    Every array command goes through this one host, so jobs on all
-    accelerators share a single command interface (as SA1 and SA2 of one
-    tile already do); each command still costs hw.array_latency. DRAM belongs
-    to the host: its one DMA moves data between DRAM and any accelerator's SRAM.
+    """One host CPU commanding n accelerators
     """
-    def __init__(self, n: int = 2, hw: Hardware = Hardware(),
-                 link_bw: float = inf, link_latency: int = 0):
+    def __init__(self,
+                 n: int = 2,
+                 hw: Hardware = Hardware(),
+                 link_bw: float = inf,
+                 link_latency: int = 0):
+
         if not isinstance(n, int) or n < 1:
             raise ValueError('Need at least one accelerator')
         self.hw = hw
@@ -399,19 +400,29 @@ class Host:
     def __len__(self) -> int:
         return len(self.accelerators)
 
-    def link(self, i: int, j: int) -> Link:
+    def link(self,
+             i: int,
+             j: int) -> Link:
         return self.links[(min(i, j), max(i, j))]
 
-    def dram(self, i: int, data, dtype: str | int, direction: str = 'read',
-             name: str | None = None, release: bool = False) -> int:
+    def dram(self,
+             i: int,
+             data,
+             dtype,
+             direction: str = 'read',
+             name= None,
+             release: bool = False) -> int:
+
         """DMA between host DRAM and accelerator i's SRAM; same cycles as DMA.transfer."""
         sram = self[i].sram if name is not None else None
         return self.dma.transfer(data, dtype, direction, sram, name, release)
+
 
     def transfer(self, i: int, j: int, data, dtype: str | int,
                  name: str | None = None, release: bool = False) -> int:
         """Move data from accelerator i to j over their link; return cycles."""
         return self.link(i, j).transfer(data, dtype, self[i], name, release)
+
 
     def command(self, i: int, array: str, rows: int, K: int,
                 dtype: str | int = 8, cols: int = 16,
@@ -428,9 +439,12 @@ class Host:
         return getattr(acc, array).compute(rows, K, dtype, cols, self.hw, sram, output)
 
 
-def sram_allocation(N: int, d: int, br: int, bc: int,
+def sram_allocation(N: int,
+                    d: int,
+                    br: int,
+                    bc: int,
                     hw: Hardware) -> dict[str, int]:
-    """Original static estimate. Independent of the live SRAM tracker."""
+
     m, c = min(br, N), min(bc, N)
     digits = hw.digits
     chunks_qk = divup(d, hw.max_reduction)

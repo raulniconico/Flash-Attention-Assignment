@@ -57,42 +57,7 @@ def _collect(tasks, counts, hw, verbose):
 def mlp(M=2048, D=4096, F=14336, Mt=192, Ft=256, Mt_sa1=None, R=256,
         residual=True, hw=Hardware(), overlap=True, verbose=True,
         gantt_path=None):
-    """Time ONE SwiGLU MLP layer for M tokens (prefill, W8A16).
 
-        G = X Wg, U = X Wu  (M x D by D x F; one GEMM with 2F columns),
-        Z = SiLU(G) * U,  Y = Z Wd (M x F by F x D),  Y += X (residual).
-    For the whole model multiply by L layers (and by B if M is one sequence).
-
-    Numerics. Weights are INT8 with per-column scales, stored in DRAM already
-    in the physical array operand layout (digit planes for safe-int8), so
-    the DMA lands them directly as array operands; no vector pass touches
-    weights. X16 and Z are quantized to INT8 with static SmoothQuant scales
-    (calibrated offline: one streaming pass, no row max) straight into the
-    operand layout. The arrays cannot accumulate across commands, so every
-    reduction chunk of <=R produces INT16 partials that the vector CPU
-    reduces in FP32: G/U chunks accumulate into an FP32 tile whose last
-    chunk pass also applies the scales, SiLU(G)*U and the Z quantization;
-    down chunks accumulate into the FP32 Y tile (written, not read, on the
-    first chunk of the first feature tile). Keeping only one or two chunk
-    partials live makes SRAM independent of D.
-
-    Tiling. Tokens in tiles of Mt; both weights are streamed once per token
-    tile (Mt MAC per weight byte, far above the DRAM ridge). Hidden features
-    in tiles of Ft: per (t, f) the arrays run gate+up (Mt x 2Ft, depth D,
-    D/R chunks) then down (Mt x D, depth Ft). Weight tiles are double-
-    buffered per operand and prefetched one feature tile ahead: Wg|Wu(f+2)
-    loads once gate+up(f) finished, Wd(f+2) once down(f) finished. X16 of
-    the next token tile is prefetched one feature tile before it is needed
-    and reloaded at the end for the residual add.
-
-    Execution model as in fa.flash_attention: DMA, vector CPU and the array
-    pair are in-order queues; a command starts when its engine is free and
-    its producers finished. Pipeline (overlap=True): arrays run gate+up(f+1)
-    before down(f) so the Z computation of tile f hides under a GEMM; the
-    vector queue accumulates gate+up chunks as they land, then Y of tile
-    f-1. Mt_sa1=None balances the SA1/SA2 row split per GEMM geometry.
-    This executes metadata and timing only.
-    """
     for value in (M, D, F, Mt, Ft, R):
         if not isinstance(value, int) or value <= 0:
             raise ValueError('Dimensions and R must be positive integers')
@@ -303,40 +268,7 @@ def mlp(M=2048, D=4096, F=14336, Mt=192, Ft=256, Mt_sa1=None, R=256,
 def mlp_decode(M=16, D=4096, F=14336, Ft=256, Nt_sa1=None, R=256,
                residual=True, hw=Hardware(), overlap=True, verbose=True,
                gantt_path=None):
-    """Time ONE SwiGLU MLP layer for ONE decode step of M concurrent tokens.
 
-        G|U^T = [Wg|Wu]^T X^T  (2F x D by D x M),  Z = SiLU(G) * U,
-        Y^T = Wd^T Z^T (+ X^T).
-    M is the decode batch (one token per sequence), so a step of B sequences
-    is one call with M=B, not B calls; multiply by L for the whole model.
-
-    Why not mlp(). mlp() puts tokens on the array rows and features on the
-    16-wide output axis, which is right for prefill and wasteful here: a job
-    pass covers 48 rows (SA1 16 + SA2 32), so M=1 fills one of them and
-    M=1..48 all cost the same 15.4 ms/layer at 11 of 552 MAC/cycle. This
-    kernel transposes the mapping - output features on the array rows (2Ft
-    of them for gate+up, D for down) and the M tokens on the 16-wide axis -
-    so every job is full for M >= 16 and any M <= 16 costs the same. The
-    weights are therefore pre-packed TRANSPOSED in DRAM ([2F, D] and [D, F]
-    in operand layout); the bytes moved are identical.
-
-    Regime. Each step re-streams all 3 D F weight bytes (168 MiB per layer;
-    one matrix is 56 MiB against 16 MiB of SRAM, so nothing stays resident)
-    for only 3 M D F MACs. Arithmetic intensity is M MAC per weight byte
-    against a ridge of 552/64 = 8.6, so up to M ~ 9 the layer is DRAM bound
-    at 2.75 ms/layer and extra sequences are free; past that it is the
-    arrays again. Decode is a bandwidth problem, prefill a compute one.
-
-    Tiling and pipeline mirror mlp(): hidden features in tiles of Ft (the
-    arrays produce 2Ft rows of G|U over D/R reduction chunks, then all D
-    rows of Y over that Ft chunk), weight tiles double-buffered and
-    prefetched two tiles ahead, gate+up(f+1) queued before down(f) so Z(f)
-    is hidden, Y accumulation lagged one tile. Chunk partials are reduced in
-    FP32 on the vector CPU, so SRAM stays independent of D. Nt_sa1 = None
-    balances the SA1/SA2 row split per GEMM; Ft=512 packs the 2Ft rows into
-    the arrays slightly better (5.34 ms, 528 MAC/cycle) but takes 80% of
-    SRAM against 41% here. Timing and metadata only.
-    """
     for value in (M, D, F, Ft, R):
         if not isinstance(value, int) or value <= 0:
             raise ValueError('Dimensions and R must be positive integers')

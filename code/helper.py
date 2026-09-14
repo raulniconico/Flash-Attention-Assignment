@@ -2,8 +2,10 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+from PIL import Image
+from IPython.display import display
 
-# Categorical hues, assigned in fixed order (never cycled).
+
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
 INK, INK_MUTED, GRID, AXIS = "#3d3d3a", "#6b6b64", "#e6e6e0", "#c9c9c1"
 
@@ -20,8 +22,14 @@ def array_ops_per_cycle(rows, K, bw_in, cols=16, out_bytes=2, bw_out=8):
     return 2 * rows * cols * K / cycles
 
 
-def plot_roofline(points, peak_ops, peak_mem, clock=1.0, title=None,
-                  xlim=(1, 1e4), figsize=(7.5, 4.8), savepath=None):
+def plot_roofline(points,
+                  peak_ops,
+                  peak_mem,
+                  clock=1.0,
+                  title=None,
+                  xlim=(1, 1e4),
+                  figsize=(7.5, 4.8),
+                  savepath=None):
     """Draw a log-log roofline.
 
     points   : list of (label, arithmetic_intensity) in ops per DRAM byte
@@ -82,8 +90,7 @@ def plot_roofline(points, peak_ops, peak_mem, clock=1.0, title=None,
     return fig, ax
 
 
-from PIL import Image
-from IPython.display import display
+
 
 def plot(img, width):
     img = Image.open(img)
@@ -91,35 +98,7 @@ def plot(img, width):
     display(img.resize((width, height)))
 
 
-#!/usr/bin/env python3
-"""Count the operations in our grouped-query FlashAttention pseudocode.
 
-Run: python fa2_compute_count.py
-     python fa2_compute_count.py --br 128 --bc 256 --sa1-rows 32 --sa2-rows 96
-
-Defaults use the bandwidth-model choice Br=Bc=256, with 128 query rows on
-each array. K16 and V16 are loaded ONCE per (layer, batch, KV head), then
-reused by all G=4 Q heads and all their query tiles.
-
-This counts attention operations, not projection/FFN GEMMs, elapsed cycles,
-or host transfers. Q/K/V have already been projected and reside in DRAM.
-One physical array command computes one output microtile, one reduction
-chunk, and one digit pair. Our safe INT8 method uses 2 digits per operand
-(4 pairs) and reduction chunks <=128. Command overlap and input preloading
-change timing, not the number of those commands.
-
-SA1 owns the first sa1_rows rows of each query block; SA2 owns the rest.
-The same fixed row ranges are used for QK and PV. A short final query block
-uses only its valid ranges; partial physical output tiles are padded.
-DMA byte totals include Q/K/V/O tensor payloads only, in 16-bit storage.
-Quantization scales and other metadata transfers are outside these totals.
-"""
-
-from collections import Counter
-import argparse
-
-
-# User's model hyperparameters.
 B = 16       # Batch size
 L = 32       # Layers
 T = 2048     # Q length

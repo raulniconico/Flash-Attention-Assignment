@@ -15,7 +15,7 @@ python_ok() {
 }
 
 PYTHON=()
-for cand in python3.12 python3.13 python3.11 python3.10 python3 python "py -3"; do
+for cand in python3.12 python3.13 python3.14 python3.11 python3.10 python3 python "py -3"; do
     read -r -a cmd <<<"$cand"
     if command -v "${cmd[0]}" >/dev/null 2>&1 && python_ok "${cmd[@]}"; then
         PYTHON=("${cmd[@]}")
