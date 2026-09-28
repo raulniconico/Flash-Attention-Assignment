@@ -8,7 +8,14 @@ UPDATE_LAG = 1  # U/l/m update of block p is queued after the pack work of p+1.
 
 
 @lru_cache(maxsize=4096)
-def _array_matmul(m, n, depth, rows_sa1, R, hw, diag=None, axis='cols'):
+def _array_matmul(m,
+                  n,
+                  depth,
+                  rows_sa1,
+                  R,
+                  hw,
+                  diag=None,
+                  axis='cols'):
     """Schedule the physical jobs of one GEMM; return completion and traffic.
 
     Rows split m between SA1 (the first rows_sa1) and SA2. One job costs
@@ -18,14 +25,22 @@ def _array_matmul(m, n, depth, rows_sa1, R, hw, diag=None, axis='cols'):
     given, a job is skipped when every entry it produces (axis='cols',
     scores) or consumes (axis='depth', P.V) is causally masked.
     """
+
+    ########  build the job list
+
+
     arrays = [SA1(compute_model=hw.array_model), SA2(compute_model=hw.array_model)]
     split = min(m, rows_sa1)
     stages, packed_bytes, raw_bytes, skipped = [], 0, 0, 0
+
+
     for sa, base, rows in zip(arrays, (0, split), (split, m - split)):
+
         if rows:
             padded_rows = divup(rows, sa.physical_rows) * sa.physical_rows
-            packed_bytes += hw.digits * (padded_rows + divup(n, 16) * 16) * depth
+            packed_bytes += hw.digits * (padded_rows + divup(n, 16) * 16) * depth ## VCPU write int16
         stream = []  # stage (input/compute) cycles of each job, in issue order
+
         for r in range(0, rows, sa.physical_rows):
             last_row = base + r + min(sa.physical_rows, rows-r) - 1
             for c in range(0, n, 16):
@@ -33,16 +48,20 @@ def _array_matmul(m, n, depth, rows_sa1, R, hw, diag=None, axis='cols'):
                     if diag is not None and (c if axis == 'cols' else k) - last_row > diag:
                         skipped += hw.digits**2
                         continue
+                    # create job
                     job = type(sa)(min(sa.physical_rows, rows-r), min(R, depth-k),
                                    min(16, n-c), hw.array_model)
                     stream += [job.stage_cycles()] * hw.digits**2
+
         stages.append(stream)
-        raw_bytes += len(stream) * sa.output_bytes()
+        raw_bytes += len(stream) * sa.output_bytes() # int16 byte
 
     advance = hw.array_latency if hw.control == 'pipelined' else 0
     interval = hw.issue_interval if hw.control == 'pipelined' else hw.array_latency
     cpu, pos, ready, drain, first = 0, [0, 0], [0, 0], [0, 0], [None, None]
     while True:
+
+        # For each array with jobs left, computes the earliest possible issue time:
         waiting = [(max(cpu, ready[a] - advance), a)
                    for a in (0, 1) if pos[a] < len(stages[a])]
         if not waiting:
@@ -52,22 +71,36 @@ def _array_matmul(m, n, depth, rows_sa1, R, hw, diag=None, axis='cols'):
             first[a] = issue
         # If the drain is occupied, hold the new result until it becomes free.
         ready[a] = max(issue + hw.array_latency + stages[a][pos[a]], drain[a])
+        #  Output draining overlaps the next job's  stage.
         drain[a] = ready[a] + arrays[a].output_cycles()
+        # Moves the CPU cursor to issue + interval
         cpu = issue + interval
         pos[a] += 1
-    return dict(start=first, end=drain, jobs=[len(s) for s in stages],
+
+    return dict(start=first,
+                end=drain,
+                jobs=[len(s) for s in stages],
                 skipped=skipped, rows_sa1=split,
                 packed_bytes=packed_bytes, raw_bytes=raw_bytes)
 
 
 @lru_cache(maxsize=4096)
-def _balanced_split(m, n, depth, R, hw, diag=None, axis='cols'):
+def _balanced_split(m,
+                    n,
+                    depth,
+                    R,
+                    hw,
+                    diag=None,
+                    axis='cols'):
     """Rows for SA1 (multiple of 16) that minimize the two-array makespan."""
     best = None
+
     for rows in sorted(set(range(0, m+1, 16)) | {m}):
         t = _array_matmul(m, n, depth, rows, R, hw, diag, axis)
         key = (max(t['end']), abs(t['end'][0]-t['end'][1]), rows)
+        # compute what is the best multiple of 16 at SA1
         best = key if best is None or key < best else best
+
     return best[2]
 
 
@@ -84,23 +117,55 @@ class _Queue:
     the intermediate is neither written to SRAM nor read back (assumes the
     vector CPU holds it in its registers).
     """
-    def __init__(self, hw, overlap=True, fuse=False):
+    def __init__(self,
+                 hw,
+                 overlap=True,
+                 fuse=False):
+
         self.hw, self.overlap, self.fuse = hw, overlap, fuse
         self.tasks, self.free_at = [], {'DMA': 0, 'VCPU': 0, 'ARRAYS': 0}
 
-    def task(self, name, unit, duration, deps=(), alloc=(), free=(), info=None):
+    def task(self,
+             name,
+             unit,
+             duration,
+             deps=(),
+             alloc=(),
+             free=(),
+             info=None):
+
         deps = [d for d in deps if d is not None]
         if not self.overlap and self.tasks:
             deps.append(self.tasks[-1]['id'])
+
+        # A task starts when device is free_at[unit] & end of every dependency).
         start = max([self.free_at[unit]] + [self.tasks[d]['end'] for d in deps])
-        rec = dict(id=len(self.tasks), name=name, unit=unit, start=start,
-                   end=start+duration, cycles=duration, deps=deps,
-                   alloc=list(alloc), free=list(free), info=info)
+
+        rec = dict(id=len(self.tasks),
+                   name=name,
+                   unit=unit,
+                   start=start,
+                   end=start+duration,
+                   cycles=duration,
+                   deps=deps,
+                   alloc=list(alloc),
+                   free=list(free),
+                   info=info)
+
         self.free_at[unit] = rec['end']
         self.tasks.append(rec)
         return rec['id']
 
-    def vector(self, name, reads, writes, deps=(), alloc=(), free=(), **kw):
+    def vector(self,
+               name,
+               reads,
+               writes,
+               deps=(),
+               alloc=(),
+               free=(),
+               **kw):
+
+
         head = self.tasks[-1] if self.fuse and self.tasks else None
         mid = ({n: b for n, b in head['alloc'] if n in free}
                if head is not None and head['unit'] == 'VCPU' else {})
@@ -109,6 +174,7 @@ class _Queue:
                             deps=deps, alloc=alloc, free=free, **kw)
             self.tasks[tid]['rw'] = (reads, writes)
             return tid
+
         # Fuse into head: drop the intermediate's write + read and one launch.
         saved = sum(mid.values())
         reads, writes = head['rw'][0] + reads - saved, head['rw'][1] + writes - saved
@@ -160,13 +226,21 @@ def _replay_sram(tasks, hw):
     return sram, peak
 
 
-def _summarize(tasks, counts, hw, verbose):
+def _summarize(tasks,
+               counts,
+               hw,
+               verbose):
+
+
     """Busy cycles per queue, job counts, Gantt events and the step table."""
     breakdown, events, steps = {}, [], []
+
     for t in sorted(tasks, key=lambda t: (t['start'], t['id'])):
         step = dict(name=t['name'], unit=t['unit'], start=t['start'], end=t['end'],
                     cycles=t['cycles'], used_bytes=t['used_bytes'])
         timing = t['info']
+
+        # adds up busy cycles per engine
         if t['unit'] != 'ARRAYS':
             counts[t['unit']] += 1
             breakdown[t['unit']] = breakdown.get(t['unit'], 0) + t['cycles']
@@ -174,6 +248,7 @@ def _summarize(tasks, counts, hw, verbose):
         else:
             step['unit'] = 'SA1+SA2'
             breakdown['SA1+SA2'] = breakdown.get('SA1+SA2', 0) + t['cycles']
+            # splits each ARRAYS task into separate SA1 and SA2 Gantt events using the stored  start/end of
             counts['skipped_jobs'] += timing['skipped']
             for a in range(2):
                 counts[f'SA{a+1}_jobs'] += timing['jobs'][a]
@@ -258,7 +333,11 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
         return min(Br_sa1, m)
 
     # ---- work list -------------------------------------------------------
+
+    # tiles: one entry per query head g and query block i, as (g, i, m)
     tiles = [(g, i, min(Br, T-i)) for g in range(G) for i in range(0, T, Br)]
+
+    # pairs: one entry per (tile, key block j)
     pairs = []
     for t, (g, i, m) in enumerate(tiles):
         key_end = min(S, q_offset+i+m) if causal else S
@@ -286,6 +365,7 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
     prev_softmax, prev_update = {}, {}
 
     def ensure_tile(t):
+        # DMA load Q16 → VCPU quantize Q + init U,l,m
         if t in tile_ready:
             return
         g, i, m = tiles[t]
@@ -299,6 +379,8 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
             free=[f'Q16@t{t}'])
 
     def emit_pack(p):
+        # VCPU QK pack
+
         if p >= P or p in packed:
             return
         pr = pairs[p]
@@ -311,6 +393,8 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
                        deps=[tile_ready[pr['tile']], qK],
                        alloc=[(f'QKdig@{p}', timing['packed_bytes'])])
         packed[p] = (pid, timing)
+
+
 
     def emit_qk(p):
         emit_pack(p)  # already packed ahead when overlapping
@@ -341,6 +425,7 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
         return pk, timing
 
     def emit_update(p):
+        # VCPU PV reconstruct → update U,l,m
         pr = pairs[p]
         t, m, tag = pr['tile'], pr['m'], pr['tag']
         rec = q.vector(tag+' PV reconstruct', tasks[pv_done[p]]['info']['raw_bytes']+4,
@@ -360,7 +445,18 @@ def flash_attention(T=2048, S=2048, H=128, G=4, Br=256, Bc=256,
             q.dma(ttag+' store O16', 2*m*H, 'write', deps=[norm],
                   free=[f'O16@t{t}'])
 
+
     # Serial schedule = the same loop with no lead, lookahead or lag.
+    """
+    - Lead of 2: the arrays always have a QK job queued. While QK(p+2) runs, the VCPU does 
+        softmax(p), so softmax "hides under" the score GEMM.                                 
+    - Pack lookahead of 3: the operands for QK(p+2) and QK(p+3) are ready before the arrays
+        need them.                                                                           
+    - Update lag of 1: the VCPU queue is strictly FIFO, so a command waiting on PV(p) would
+        block every VCPU command behind it. Putting update(p-1) after pack(p+3) means the    
+        VCPU only reaches that update once PV(p-1) has already finished. 
+    """
+
     lead, ahead, lag = (QK_LEAD, PACK_LOOKAHEAD, UPDATE_LAG) if overlap else (0, 0, 0)
     for p in range(ahead):
         emit_pack(p)
